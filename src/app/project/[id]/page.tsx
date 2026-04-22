@@ -50,6 +50,7 @@ export default function ProjectPage() {
   const [submitting, setSubmitting] = useState(false)
   const [indexing, setIndexing] = useState(false)
   const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(null)
+  const [indexJustDone, setIndexJustDone] = useState(false)
   const [loading, setLoading] = useState(true)
   const [expandedTask, setExpandedTask] = useState<string | null>(null)
 
@@ -113,7 +114,12 @@ export default function ProjectPage() {
             try {
               const data = JSON.parse(line.slice(6)) as IndexProgress
               setIndexProgress(data)
-              if (data.phase === 'done' || data.phase === 'error') {
+              if (data.phase === 'done') {
+                await loadProject()
+                setIndexJustDone(true)
+                // Keep the success banner visible for 4 seconds then clear
+                setTimeout(() => setIndexJustDone(false), 4000)
+              } else if (data.phase === 'error') {
                 await loadProject()
               }
             } catch {}
@@ -233,29 +239,70 @@ export default function ProjectPage() {
             </button>
           </div>
 
-          {/* Progress bar */}
-          {indexing && indexProgress && (
+          {/* Success banner — shown for 4s after indexing completes */}
+          {indexJustDone && indexProgress && (
+            <div className="mt-4 flex items-center gap-3 px-4 py-3 rounded-lg bg-green-950/60 border border-green-800">
+              <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-green-300 font-medium">Indexing complete!</p>
+                <p className="text-xs text-green-600 mt-0.5">{indexProgress.message} — you can now submit tasks below.</p>
+              </div>
+            </div>
+          )}
+
+          {/* Progress bar — shown while indexing */}
+          {indexing && indexProgress && !indexJustDone && (
             <div className="mt-4">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs text-zinc-500">{indexProgress.message}</span>
-                {indexProgress.chunksTotal && (
+                {indexProgress.chunksTotal ? (
                   <span className="text-xs text-zinc-600">
-                    {indexProgress.filesDone ?? 0}/{indexProgress.chunksTotal} chunks
+                    {indexProgress.chunksTotal} chunks
                   </span>
-                )}
+                ) : indexProgress.filesTotal ? (
+                  <span className="text-xs text-zinc-600">
+                    {indexProgress.filesDone ?? 0}/{indexProgress.filesTotal} files
+                  </span>
+                ) : null}
               </div>
               <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
                 <div
-                  className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                  className="h-full bg-blue-500 rounded-full transition-all duration-500"
                   style={{
-                    width: indexProgress.phase === 'done'
-                      ? '100%'
-                      : indexProgress.chunksTotal
-                      ? `${Math.min(99, ((indexProgress.filesDone ?? 0) / indexProgress.chunksTotal) * 100)}%`
-                      : '15%',
+                    width:
+                      indexProgress.phase === 'tree'  ? '8%'  :
+                      indexProgress.phase === 'fetch' ? `${10 + Math.min(30, ((indexProgress.filesDone ?? 0) / Math.max(1, indexProgress.filesTotal ?? 1)) * 30)}%` :
+                      indexProgress.phase === 'chunk' ? '55%' :
+                      indexProgress.phase === 'embed' ? '70%' :
+                      indexProgress.phase === 'store' ? '90%' :
+                      '99%',
                   }}
                 />
               </div>
+              <div className="flex justify-between mt-1.5">
+                {(['tree','fetch','chunk','embed','store'] as const).map((phase) => (
+                  <span
+                    key={phase}
+                    className={`text-xs capitalize ${
+                      indexProgress.phase === phase
+                        ? 'text-blue-400 font-medium'
+                        : (['tree','fetch','chunk','embed','store'].indexOf(indexProgress.phase ?? '') >
+                           ['tree','fetch','chunk','embed','store'].indexOf(phase))
+                        ? 'text-zinc-500'
+                        : 'text-zinc-700'
+                    }`}
+                  >
+                    {phase}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Error state */}
+          {indexProgress?.phase === 'error' && !indexing && (
+            <div className="mt-4 px-4 py-3 rounded-lg bg-red-950/50 border border-red-900">
+              <p className="text-xs text-red-400">{indexProgress.message}</p>
             </div>
           )}
         </div>
