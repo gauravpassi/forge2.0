@@ -14,12 +14,12 @@ function getGenAI(): GoogleGenerativeAI {
 // ── Models ────────────────────────────────────────────────────────
 
 export const MODELS = {
-  // Tier 1 — planning, commit messages, PR bodies (fast + cheap calls)
-  FLASH:    'gemini-2.5-flash-preview-05-20',
+  // Tier 1 — planning, commit messages, PR bodies (fast + cheap)
+  FLASH:    'gemini-2.5-flash-lite',
   // Tier 2 — new features, moderate complexity
-  FLASH_25: 'gemini-2.5-flash-preview-05-20',
+  FLASH_25: 'gemini-2.5-flash',
   // Tier 3 — architecture, refactors, multi-file complex tasks
-  THINKING: 'gemini-2.5-flash-preview-05-20', // thinking mode via thinkingConfig
+  THINKING: 'gemini-2.5-flash', // thinking mode via thinkingConfig
 } as const
 
 export type TaskComplexity = 'simple' | 'medium' | 'complex'
