@@ -55,6 +55,21 @@ export async function upsertUser(user: {
 
 // ── Project helpers ───────────────────────────────────────────────
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapProject(row: any) {
+  return {
+    id:             row.id            as string,
+    userId:         row.user_id       as string,
+    repoFullName:   row.repo_full_name as string,
+    repoId:         row.repo_id       as number | null,
+    defaultBranch:  row.default_branch as string,
+    lastIndexedAt:  row.last_indexed_at as string | null,
+    indexStatus:    row.index_status  as 'idle' | 'indexing' | 'ready' | 'error',
+    vercelProject:  row.vercel_project as string | null,
+    createdAt:      row.created_at    as string,
+  }
+}
+
 export async function getProject(projectId: string) {
   const { data, error } = await getSupabaseAdmin()
     .from('projects')
@@ -62,7 +77,7 @@ export async function getProject(projectId: string) {
     .eq('id', projectId)
     .single()
   if (error) throw error
-  return data
+  return mapProject(data)
 }
 
 export async function getUserProjects(userId: string) {
@@ -72,7 +87,7 @@ export async function getUserProjects(userId: string) {
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
   if (error) throw error
-  return data ?? []
+  return (data ?? []).map(mapProject)
 }
 
 export async function createProject(input: {
@@ -93,7 +108,7 @@ export async function createProject(input: {
     .select()
     .single()
   if (error) throw error
-  return data
+  return mapProject(data)
 }
 
 export async function updateProjectIndexStatus(
@@ -163,6 +178,25 @@ export async function insertChunks(
 
 // ── Task helpers ──────────────────────────────────────────────────
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapTask(row: any) {
+  return {
+    id:            row.id           as string,
+    projectId:     row.project_id   as string,
+    userId:        row.user_id      as string,
+    description:   row.description  as string,
+    status:        row.status       as 'queued' | 'running' | 'done' | 'failed',
+    branchName:    row.branch_name  as string | null,
+    prUrl:         row.pr_url       as string | null,
+    deployUrl:     row.deploy_url   as string | null,
+    error:         row.error        as string | null,
+    resultSummary: row.result_summary as string | null,
+    filesChanged:  row.files_changed  as Array<{ path: string; action: string }> | null,
+    createdAt:     row.created_at   as string,
+    completedAt:   row.completed_at as string | null,
+  }
+}
+
 export async function createTask(input: {
   projectId: string
   userId: string
@@ -179,7 +213,7 @@ export async function createTask(input: {
     .select()
     .single()
   if (error) throw error
-  return data
+  return mapTask(data)
 }
 
 export async function updateTask(
@@ -217,5 +251,5 @@ export async function getProjectTasks(projectId: string) {
     .order('created_at', { ascending: false })
     .limit(50)
   if (error) throw error
-  return data ?? []
+  return (data ?? []).map(mapTask)
 }

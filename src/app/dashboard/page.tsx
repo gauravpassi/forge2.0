@@ -274,12 +274,27 @@ export default function DashboardPage() {
 
 // ── Sub-components ────────────────────────────────────────────────
 
+/** "owner/my-cool-repo" → "My Cool Repo" (title line) + "owner" (subtitle) */
+function formatRepoName(repoFullName: string): { title: string; owner: string; slug: string } {
+  const [owner, repoSlug] = repoFullName.split('/')
+  const title = (repoSlug ?? repoFullName)
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+  return { title, owner: owner ?? '', slug: repoSlug ?? repoFullName }
+}
+
 function ProjectCard({ project, onClick }: { project: Project; onClick: () => void }) {
   const statusColor: Record<string, string> = {
     idle: 'text-zinc-500',
     indexing: 'text-yellow-400',
     ready: 'text-green-400',
     error: 'text-red-400',
+  }
+  const statusDot: Record<string, string> = {
+    idle: 'bg-zinc-600',
+    indexing: 'bg-yellow-400 animate-pulse',
+    ready: 'bg-green-400',
+    error: 'bg-red-400',
   }
   const statusLabel: Record<string, string> = {
     idle: 'Not indexed',
@@ -288,20 +303,33 @@ function ProjectCard({ project, onClick }: { project: Project; onClick: () => vo
     error: 'Index error',
   }
 
+  const { title, owner, slug } = formatRepoName(project.repoFullName ?? '')
+
   return (
     <button
       onClick={onClick}
       className="flex items-center justify-between p-4 rounded-xl bg-zinc-900 border border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/60 transition-all text-left group"
     >
       <div className="flex items-center gap-4">
-        <div className="w-10 h-10 rounded-lg bg-zinc-800 flex items-center justify-center shrink-0">
-          <GithubIcon className="w-5 h-5 text-zinc-400" />
+        {/* Avatar: first letter of repo name */}
+        <div className="w-10 h-10 rounded-lg bg-blue-600/20 border border-blue-600/30 flex items-center justify-center shrink-0">
+          <span className="text-base font-bold text-blue-400 leading-none">
+            {slug.charAt(0).toUpperCase()}
+          </span>
         </div>
         <div>
-          <p className="font-medium text-zinc-100 group-hover:text-white">{project.repoFullName}</p>
-          <p className={`text-xs mt-0.5 ${statusColor[project.indexStatus] ?? 'text-zinc-500'}`}>
-            {statusLabel[project.indexStatus] ?? project.indexStatus}
+          <p className="font-semibold text-zinc-100 group-hover:text-white leading-tight">
+            {title}
           </p>
+          <div className="flex items-center gap-2 mt-1">
+            <GithubIcon className="w-3 h-3 text-zinc-600" />
+            <span className="text-xs text-zinc-500">{owner}/{slug}</span>
+            <span className="text-zinc-700">·</span>
+            <span className={`flex items-center gap-1.5 text-xs ${statusColor[project.indexStatus] ?? 'text-zinc-500'}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${statusDot[project.indexStatus] ?? 'bg-zinc-600'}`} />
+              {statusLabel[project.indexStatus] ?? project.indexStatus}
+            </span>
+          </div>
         </div>
       </div>
       <ChevronRight className="w-4 h-4 text-zinc-600 group-hover:text-zinc-400 transition-colors" />

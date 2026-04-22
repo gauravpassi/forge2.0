@@ -22,7 +22,7 @@ export async function POST(
     const project = await getProject(projectId)
 
     // Ownership check
-    if (project.user_id !== session.user.id) {
+    if (project.userId !== session.user.id) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
 
@@ -37,8 +37,8 @@ export async function POST(
         try {
           const result = await indexRepository(
             projectId,
-            project.repo_full_name,
-            project.default_branch,
+            project.repoFullName,
+            project.defaultBranch,
             session.accessToken!,
             (progress) => send(progress)
           )

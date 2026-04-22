@@ -18,7 +18,7 @@ export async function GET(
 
   try {
     const project = await getProject(projectId)
-    if (project.user_id !== session.user.id) {
+    if (project.userId !== session.user.id) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
     return NextResponse.json({ data: project })

@@ -20,7 +20,7 @@ export async function GET(
 
   try {
     const project = await getProject(projectId)
-    if (project.user_id !== session.user.id) {
+    if (project.userId !== session.user.id) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
 
@@ -53,11 +53,11 @@ export async function POST(
     }
 
     const project = await getProject(projectId)
-    if (project.user_id !== session.user.id) {
+    if (project.userId !== session.user.id) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
 
-    if (project.index_status !== 'ready') {
+    if (project.indexStatus !== 'ready') {
       return NextResponse.json(
         { error: 'Repository must be indexed before running tasks. Please index it first.' },
         { status: 422 }
@@ -76,10 +76,10 @@ export async function POST(
       taskId: task.id,
       projectId,
       description: description.trim(),
-      repoFullName: project.repo_full_name,
-      defaultBranch: project.default_branch,
+      repoFullName: project.repoFullName,
+      defaultBranch: project.defaultBranch,
       accessToken: session.accessToken,
-      vercelProject: project.vercel_project,
+      vercelProject: project.vercelProject,
     })
       .then(async (result) => {
         await updateTask(task.id, {
