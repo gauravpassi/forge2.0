@@ -4,7 +4,7 @@
 // ════════════════════════════════════════════════════════════════
 
 import { embedText } from '@/lib/ai/gemini'
-import { supabaseAdmin } from '@/lib/supabase'
+import { getSupabaseAdmin } from '@/lib/supabase'
 import type { SearchResult } from '@/types'
 
 export interface SearchOptions {
@@ -25,7 +25,7 @@ export async function searchCodebase(
   const queryEmbedding = await embedText(query)
 
   // Call the pgvector similarity function
-  const { data, error } = await supabaseAdmin.rpc('match_code_chunks', {
+  const { data, error } = await getSupabaseAdmin().rpc('match_code_chunks', {
     query_embedding: queryEmbedding,
     match_project_id: projectId,
     match_threshold: matchThreshold,

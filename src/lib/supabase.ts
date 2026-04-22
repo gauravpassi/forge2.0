@@ -1,16 +1,33 @@
-import { createClient } from '@supabase/supabase-js'
+import { createClient, SupabaseClient } from '@supabase/supabase-js'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!
+// ── Lazy-initialized clients (safe for builds without env vars) ───
+
+let _supabase: SupabaseClient | null = null
+let _supabaseAdmin: SupabaseClient | null = null
 
 // Public client — for client-side reads (subject to RLS)
-export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+export function getSupabase(): SupabaseClient {
+  if (!_supabase) {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    if (!url || !key) throw new Error('Supabase public env vars not set')
+    _supabase = createClient(url, key)
+  }
+  return _supabase
+}
 
 // Service role client — for server-side mutations (bypasses RLS)
-export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-  auth: { autoRefreshToken: false, persistSession: false },
-})
+export function getSupabaseAdmin(): SupabaseClient {
+  if (!_supabaseAdmin) {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    if (!url || !key) throw new Error('Supabase service role env vars not set')
+    _supabaseAdmin = createClient(url, key, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  }
+  return _supabaseAdmin
+}
 
 // ── User helpers ──────────────────────────────────────────────────
 
@@ -21,7 +38,7 @@ export async function upsertUser(user: {
   avatarUrl: string | null
   email: string | null
 }) {
-  const { error } = await supabaseAdmin
+  const { error } = await getSupabaseAdmin()
     .from('users')
     .upsert(
       {
@@ -39,7 +56,7 @@ export async function upsertUser(user: {
 // ── Project helpers ───────────────────────────────────────────────
 
 export async function getProject(projectId: string) {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from('projects')
     .select('*')
     .eq('id', projectId)
@@ -49,7 +66,7 @@ export async function getProject(projectId: string) {
 }
 
 export async function getUserProjects(userId: string) {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from('projects')
     .select('*')
     .eq('user_id', userId)
@@ -64,7 +81,7 @@ export async function createProject(input: {
   repoId: number
   defaultBranch: string
 }) {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from('projects')
     .insert({
       user_id: input.userId,
@@ -84,7 +101,7 @@ export async function updateProjectIndexStatus(
   status: 'idle' | 'indexing' | 'ready' | 'error',
   lastIndexedAt?: Date
 ) {
-  const { error } = await supabaseAdmin
+  const { error } = await getSupabaseAdmin()
     .from('projects')
     .update({
       index_status: status,
@@ -97,7 +114,7 @@ export async function updateProjectIndexStatus(
 // ── Chunk helpers ─────────────────────────────────────────────────
 
 export async function deleteProjectChunks(projectId: string) {
-  const { error } = await supabaseAdmin
+  const { error } = await getSupabaseAdmin()
     .from('code_chunks')
     .delete()
     .eq('project_id', projectId)
@@ -105,7 +122,7 @@ export async function deleteProjectChunks(projectId: string) {
 }
 
 export async function deleteFileChunks(projectId: string, filePath: string) {
-  const { error } = await supabaseAdmin
+  const { error } = await getSupabaseAdmin()
     .from('code_chunks')
     .delete()
     .eq('project_id', projectId)
@@ -140,7 +157,7 @@ export async function insertChunks(
     embedding: JSON.stringify(c.embedding), // pgvector expects array literal
   }))
 
-  const { error } = await supabaseAdmin.from('code_chunks').insert(rows)
+  const { error } = await getSupabaseAdmin().from('code_chunks').insert(rows)
   if (error) throw error
 }
 
@@ -151,7 +168,7 @@ export async function createTask(input: {
   userId: string
   description: string
 }) {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from('tasks')
     .insert({
       project_id: input.projectId,
@@ -188,12 +205,12 @@ export async function updateTask(
   if (update.filesChanged !== undefined) mapped.files_changed = update.filesChanged
   if (update.completedAt !== undefined) mapped.completed_at = update.completedAt
 
-  const { error } = await supabaseAdmin.from('tasks').update(mapped).eq('id', taskId)
+  const { error } = await getSupabaseAdmin().from('tasks').update(mapped).eq('id', taskId)
   if (error) throw error
 }
 
 export async function getProjectTasks(projectId: string) {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await getSupabaseAdmin()
     .from('tasks')
     .select('*')
     .eq('project_id', projectId)
