@@ -44,7 +44,24 @@ export async function POST(
           )
           send({ phase: 'done', chunksIndexed: result.chunksIndexed })
         } catch (err) {
-          send({ phase: 'error', message: String(err) })
+          const raw = String(err)
+          let message = raw
+
+          // Surface actionable quota / rate-limit errors
+          if (raw.includes('embed_content_free_tier_requests') || raw.includes('Quota exceeded')) {
+            message =
+              '🚫 Gemini embedding daily quota exceeded (free tier limit: 1,000 requests/day). ' +
+              'Enable billing at aistudio.google.com to continue — ' +
+              'paid tier has no daily cap and costs ~$0.00004 per 1K tokens.'
+          } else if (raw.includes('429') || raw.includes('Too Many Requests')) {
+            message =
+              '⏳ Gemini rate limit hit. The indexer will retry automatically — ' +
+              'if this keeps happening, enable billing at aistudio.google.com to get 1,500 RPM.'
+          } else if (raw.includes('API_KEY') || raw.includes('API key')) {
+            message = '🔑 Invalid Gemini API key. Check GOOGLE_GEMINI_API_KEY in your environment.'
+          }
+
+          send({ phase: 'error', message })
         } finally {
           controller.close()
         }
