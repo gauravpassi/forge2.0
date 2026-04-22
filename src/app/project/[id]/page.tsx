@@ -6,7 +6,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import {
   ArrowLeft,
   Zap,
-  Database,
+  Brain,
   GitBranch,
   ExternalLink,
   Send,
@@ -15,21 +15,13 @@ import {
   XCircle,
   Clock,
   Loader2,
-  ChevronDown,
-  ChevronUp,
   FileCode,
+  Plus,
+  Sparkles,
 } from 'lucide-react'
 import type { Project, Task } from '@/types'
 
-type IndexPhase =
-  | 'tree'
-  | 'fetch'
-  | 'chunk'
-  | 'embed'
-  | 'store'
-  | 'done'
-  | 'error'
-  | null
+type IndexPhase = 'tree' | 'fetch' | 'chunk' | 'embed' | 'store' | 'done' | 'error' | null
 
 interface IndexProgress {
   phase: IndexPhase
@@ -39,29 +31,39 @@ interface IndexProgress {
   message: string
 }
 
+// Friendly phase labels shown under the progress bar
+const PHASE_LABELS: Record<string, string> = {
+  tree:  'Scanning files',
+  fetch: 'Reading code',
+  chunk: 'Breaking it down',
+  embed: 'Understanding patterns',
+  store: 'Saving knowledge',
+}
+const PHASE_ORDER = ['tree', 'fetch', 'chunk', 'embed', 'store']
+
 export default function ProjectPage() {
   const { data: session, status } = useSession()
   const router = useRouter()
   const { id: projectId } = useParams<{ id: string }>()
 
-  const [project, setProject] = useState<Project | null>(null)
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [taskInput, setTaskInput] = useState('')
-  const [submitting, setSubmitting] = useState(false)
-  const [indexing, setIndexing] = useState(false)
+  const [project, setProject]           = useState<Project | null>(null)
+  const [tasks, setTasks]               = useState<Task[]>([])
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [view, setView]                 = useState<'submit' | 'task'>('submit')
+  const [taskInput, setTaskInput]       = useState('')
+  const [submitting, setSubmitting]     = useState(false)
+  const [indexing, setIndexing]         = useState(false)
   const [indexProgress, setIndexProgress] = useState<IndexProgress | null>(null)
   const [indexJustDone, setIndexJustDone] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [expandedTask, setExpandedTask] = useState<string | null>(null)
+  const [indexedFileCount, setIndexedFileCount] = useState<number | null>(null)
+  const [loading, setLoading]           = useState(true)
 
   const pollRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Redirect if not authed
   useEffect(() => {
     if (status === 'unauthenticated') router.push('/')
   }, [status, router])
 
-  // Load project + tasks
   const loadProject = useCallback(async () => {
     const [projRes, tasksRes] = await Promise.all([
       fetch(`/api/projects/${projectId}`),
@@ -77,27 +79,24 @@ export default function ProjectPage() {
     if (status === 'authenticated') loadProject()
   }, [status, loadProject])
 
-  // Poll tasks while any are running/queued
+  // Poll while tasks are active
   useEffect(() => {
     const hasActive = tasks.some((t) => t.status === 'running' || t.status === 'queued')
     if (hasActive) {
-      pollRef.current = setInterval(() => {
-        loadProject()
-      }, 4000)
+      pollRef.current = setInterval(loadProject, 4000)
     } else {
       if (pollRef.current) clearInterval(pollRef.current)
     }
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
-    }
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [tasks, loadProject])
 
-  // ── Index repo ────────────────────────────────────────────────
+  // ── Index ─────────────────────────────────────────────────────
 
   async function startIndexing() {
     if (!project || indexing) return
     setIndexing(true)
-    setIndexProgress({ phase: 'tree', message: 'Starting indexer…' })
+    setIndexJustDone(false)
+    setIndexProgress({ phase: 'tree', message: 'Starting…' })
 
     try {
       const res = await fetch(`/api/projects/${projectId}/index`, { method: 'POST' })
@@ -108,22 +107,20 @@ export default function ProjectPage() {
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
-        const text = decoder.decode(value, { stream: true })
-        for (const line of text.split('\n')) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6)) as IndexProgress
-              setIndexProgress(data)
-              if (data.phase === 'done') {
-                await loadProject()
-                setIndexJustDone(true)
-                // Keep the success banner visible for 4 seconds then clear
-                setTimeout(() => setIndexJustDone(false), 4000)
-              } else if (data.phase === 'error') {
-                await loadProject()
-              }
-            } catch {}
-          }
+        for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const data = JSON.parse(line.slice(6)) as IndexProgress
+            setIndexProgress(data)
+            if (data.filesTotal) setIndexedFileCount(data.filesTotal)
+            if (data.phase === 'done') {
+              await loadProject()
+              setIndexJustDone(true)
+              setTimeout(() => setIndexJustDone(false), 5000)
+            } else if (data.phase === 'error') {
+              await loadProject()
+            }
+          } catch {}
         }
       }
     } finally {
@@ -146,7 +143,10 @@ export default function ProjectPage() {
       const json = await res.json()
       if (json.data) {
         setTaskInput('')
-        setTasks((prev) => [json.data, ...prev])
+        const newTask = json.data as Task
+        setTasks((prev) => [newTask, ...prev])
+        setSelectedTaskId(newTask.id)
+        setView('task')
       } else {
         alert(json.error ?? 'Failed to submit task')
       }
@@ -155,7 +155,18 @@ export default function ProjectPage() {
     }
   }
 
-  // ── Render ────────────────────────────────────────────────────
+  // ── Cancel task ───────────────────────────────────────────────
+
+  async function cancelTask(taskId: string) {
+    await fetch(`/api/projects/${projectId}/tasks`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId }),
+    })
+    await loadProject()
+  }
+
+  // ── Loading ───────────────────────────────────────────────────
 
   if (status === 'loading' || loading) {
     return (
@@ -173,13 +184,15 @@ export default function ProjectPage() {
     )
   }
 
-  const isReady = project.indexStatus === 'ready'
+  const isReady    = project.indexStatus === 'ready'
   const isIndexing = project.indexStatus === 'indexing' || indexing
+  const selectedTask = tasks.find((t) => t.id === selectedTaskId) ?? null
 
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col">
-      {/* Topbar */}
-      <header className="border-b border-zinc-800 px-6 py-3 flex items-center gap-4">
+    <div className="h-screen bg-zinc-950 flex flex-col overflow-hidden">
+
+      {/* ── Topbar ── */}
+      <header className="shrink-0 border-b border-zinc-800 px-4 py-2.5 flex items-center gap-3">
         <button
           onClick={() => router.push('/dashboard')}
           className="p-1.5 rounded-md hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors"
@@ -193,219 +206,273 @@ export default function ProjectPage() {
           <span className="font-semibold text-zinc-100 text-sm">Forge 2.0</span>
         </div>
         <span className="text-zinc-700">/</span>
-        <span className="text-zinc-400 text-sm">{project.repoFullName}</span>
-        <IndexStatusBadge status={project.indexStatus} />
+        <span className="text-zinc-400 text-sm truncate">{project.repoFullName}</span>
       </header>
 
-      <div className="flex-1 max-w-4xl mx-auto w-full px-6 py-8 flex flex-col gap-8">
+      {/* ── Body: sidebar + main ── */}
+      <div className="flex-1 flex overflow-hidden">
 
-        {/* ── Knowledge Base card ── */}
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-6">
-          <div className="flex items-start justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-zinc-800 flex items-center justify-center">
-                <Database className="w-5 h-5 text-blue-400" />
-              </div>
-              <div>
-                <h2 className="font-semibold text-zinc-100">Knowledge Base</h2>
-                <p className="text-zinc-500 text-sm mt-0.5">
-                  {isReady
-                    ? `Indexed · Last updated ${project.lastIndexedAt ? new Date(project.lastIndexedAt).toLocaleDateString() : 'recently'}`
-                    : isIndexing
-                    ? 'Building knowledge base…'
-                    : 'Not indexed yet — index before running tasks'}
-                </p>
-              </div>
-            </div>
-
+        {/* ── Left sidebar: task history ── */}
+        <aside className="w-64 shrink-0 border-r border-zinc-800 flex flex-col overflow-hidden">
+          <div className="px-3 py-3 border-b border-zinc-800 flex items-center justify-between">
+            <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Tasks</span>
             <button
-              onClick={startIndexing}
-              disabled={isIndexing}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                isIndexing
-                  ? 'bg-zinc-800 text-zinc-500 cursor-wait'
-                  : isReady
-                  ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
-                  : 'bg-blue-600 hover:bg-blue-500 text-white'
-              }`}
+              onClick={() => { setSelectedTaskId(null); setView('submit') }}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 transition-colors"
             >
-              {isIndexing ? (
-                <><Loader2 className="w-4 h-4 animate-spin" /> Indexing…</>
-              ) : isReady ? (
-                <><RefreshCw className="w-4 h-4" /> Re-index</>
-              ) : (
-                <><Database className="w-4 h-4" /> Index Repo</>
-              )}
+              <Plus className="w-3 h-3" />
+              New
             </button>
           </div>
 
-          {/* Success banner — shown for 4s after indexing completes */}
-          {indexJustDone && indexProgress && (
-            <div className="mt-4 flex items-center gap-3 px-4 py-3 rounded-lg bg-green-950/60 border border-green-800">
-              <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-green-300 font-medium">Indexing complete!</p>
-                <p className="text-xs text-green-600 mt-0.5">{indexProgress.message} — you can now submit tasks below.</p>
-              </div>
-            </div>
-          )}
-
-          {/* Progress bar — shown while indexing */}
-          {indexing && indexProgress && !indexJustDone && (
-            <div className="mt-4">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs text-zinc-500">{indexProgress.message}</span>
-                {indexProgress.chunksTotal ? (
-                  <span className="text-xs text-zinc-600">
-                    {indexProgress.chunksTotal} chunks
-                  </span>
-                ) : indexProgress.filesTotal ? (
-                  <span className="text-xs text-zinc-600">
-                    {indexProgress.filesDone ?? 0}/{indexProgress.filesTotal} files
-                  </span>
-                ) : null}
-              </div>
-              <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-                <div
-                  className="h-full bg-blue-500 rounded-full transition-all duration-500"
-                  style={{
-                    width:
-                      indexProgress.phase === 'tree'  ? '8%'  :
-                      indexProgress.phase === 'fetch' ? `${10 + Math.min(30, ((indexProgress.filesDone ?? 0) / Math.max(1, indexProgress.filesTotal ?? 1)) * 30)}%` :
-                      indexProgress.phase === 'chunk' ? '55%' :
-                      indexProgress.phase === 'embed' ? '70%' :
-                      indexProgress.phase === 'store' ? '90%' :
-                      '99%',
-                  }}
-                />
-              </div>
-              <div className="flex justify-between mt-1.5">
-                {(['tree','fetch','chunk','embed','store'] as const).map((phase) => (
-                  <span
-                    key={phase}
-                    className={`text-xs capitalize ${
-                      indexProgress.phase === phase
-                        ? 'text-blue-400 font-medium'
-                        : (['tree','fetch','chunk','embed','store'].indexOf(indexProgress.phase ?? '') >
-                           ['tree','fetch','chunk','embed','store'].indexOf(phase))
-                        ? 'text-zinc-500'
-                        : 'text-zinc-700'
-                    }`}
-                  >
-                    {phase}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Error state */}
-          {indexProgress?.phase === 'error' && !indexing && (
-            <div className="mt-4 px-4 py-3 rounded-lg bg-red-950/50 border border-red-900">
-              <p className="text-xs text-red-400">{indexProgress.message}</p>
-            </div>
-          )}
-        </div>
-
-        {/* ── Task submission ── */}
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-6">
-          <h2 className="font-semibold text-zinc-100 mb-4">Submit a Task</h2>
-          <form onSubmit={submitTask} className="flex gap-3">
-            <div className="flex-1 relative">
-              <textarea
-                value={taskInput}
-                onChange={(e) => setTaskInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitTask(e as unknown as React.FormEvent)
-                }}
-                placeholder={
-                  isReady
-                    ? 'Describe what you want to build or fix… (⌘+Enter to submit)'
-                    : 'Index the repo first before submitting tasks'
-                }
-                disabled={!isReady || submitting}
-                rows={3}
-                className="w-full px-4 py-3 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-600 text-sm resize-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={!isReady || !taskInput.trim() || submitting}
-              className="self-end px-4 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {submitting ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Send className="w-4 h-4" />
-              )}
-            </button>
-          </form>
-          {!isReady && !isIndexing && (
-            <p className="mt-3 text-xs text-yellow-500">
-              ⚠ Index the repository first so Forge understands your codebase.
-            </p>
-          )}
-        </div>
-
-        {/* ── Task list ── */}
-        {tasks.length > 0 && (
-          <div>
-            <h2 className="font-semibold text-zinc-100 mb-4">Tasks</h2>
-            <div className="flex flex-col gap-3">
-              {tasks.map((task) => (
-                <TaskCard
+          <div className="flex-1 overflow-y-auto py-2">
+            {tasks.length === 0 ? (
+              <p className="text-xs text-zinc-600 text-center mt-8 px-4">
+                No tasks yet — submit one to get started
+              </p>
+            ) : (
+              tasks.map((task) => (
+                <TaskRow
                   key={task.id}
                   task={task}
-                  expanded={expandedTask === task.id}
-                  onToggle={() => setExpandedTask(expandedTask === task.id ? null : task.id)}
-                  onCancel={async (taskId) => {
-                    await fetch(`/api/projects/${projectId}/tasks`, {
-                      method: 'PATCH',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ taskId }),
-                    })
-                    await loadProject()
-                  }}
+                  selected={selectedTaskId === task.id}
+                  onClick={() => { setSelectedTaskId(task.id); setView('task') }}
                 />
-              ))}
-            </div>
+              ))
+            )}
           </div>
-        )}
+        </aside>
+
+        {/* ── Main panel ── */}
+        <main className="flex-1 overflow-y-auto">
+          <div className="max-w-2xl mx-auto px-6 py-6 flex flex-col gap-5">
+
+            {/* ── Codebase card ── */}
+            <CodebaseCard
+              project={project}
+              isReady={isReady}
+              isIndexing={isIndexing}
+              indexProgress={indexProgress}
+              indexJustDone={indexJustDone}
+              indexedFileCount={indexedFileCount}
+              onIndex={startIndexing}
+            />
+
+            {/* ── Submit form or task detail ── */}
+            {view === 'submit' || !selectedTask ? (
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5">
+                <div className="flex items-center gap-2 mb-4">
+                  <Sparkles className="w-4 h-4 text-blue-400" />
+                  <h2 className="font-semibold text-zinc-100 text-sm">What do you want to build?</h2>
+                </div>
+                <form onSubmit={submitTask}>
+                  <textarea
+                    value={taskInput}
+                    onChange={(e) => setTaskInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitTask(e as unknown as React.FormEvent)
+                    }}
+                    placeholder={
+                      isReady
+                        ? 'e.g. "Add a dark mode toggle to the navbar" or "Fix the login redirect bug"'
+                        : 'Set up your codebase first using the panel above'
+                    }
+                    disabled={!isReady || submitting}
+                    rows={4}
+                    className="w-full px-4 py-3 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-600 text-sm resize-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                  />
+                  <div className="flex items-center justify-between mt-3">
+                    <span className="text-xs text-zinc-600">⌘+Enter to submit</span>
+                    <button
+                      type="submit"
+                      disabled={!isReady || !taskInput.trim() || submitting}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                      {submitting ? 'Submitting…' : 'Run task'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            ) : (
+              <TaskDetail task={selectedTask} onCancel={cancelTask} />
+            )}
+
+          </div>
+        </main>
       </div>
     </div>
   )
 }
 
-// ── Sub-components ────────────────────────────────────────────────
+// ── Codebase card ─────────────────────────────────────────────────
 
-function IndexStatusBadge({ status }: { status: string }) {
-  const map: Record<string, { label: string; cls: string }> = {
-    idle: { label: 'Not indexed', cls: 'bg-zinc-800 text-zinc-500' },
-    indexing: { label: 'Indexing', cls: 'bg-yellow-950 text-yellow-400 border border-yellow-800' },
-    ready: { label: 'Ready', cls: 'bg-green-950 text-green-400 border border-green-800' },
-    error: { label: 'Error', cls: 'bg-red-950 text-red-400 border border-red-800' },
-  }
-  const s = map[status] ?? map.idle
+function CodebaseCard({
+  project, isReady, isIndexing, indexProgress, indexJustDone, indexedFileCount, onIndex,
+}: {
+  project: Project
+  isReady: boolean
+  isIndexing: boolean
+  indexProgress: IndexProgress | null
+  indexJustDone: boolean
+  indexedFileCount: number | null
+  onIndex: () => void
+}) {
+  const currentPhaseIdx = PHASE_ORDER.indexOf(indexProgress?.phase ?? '')
+
+  const subtitle = isIndexing
+    ? 'Learning your codebase…'
+    : isReady
+    ? `Forge understands your codebase${indexedFileCount ? ` · ${indexedFileCount} files` : project.lastIndexedAt ? ` · updated ${new Date(project.lastIndexedAt).toLocaleDateString()}` : ''}`
+    : project.indexStatus === 'error'
+    ? 'Something went wrong — try again'
+    : 'Not set up yet — let Forge read your code before running tasks'
+
   return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${s.cls}`}>
-      {s.label}
-    </span>
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+            isReady ? 'bg-blue-600/20' : 'bg-zinc-800'
+          }`}>
+            <Brain className={`w-4 h-4 ${isReady ? 'text-blue-400' : 'text-zinc-500'}`} />
+          </div>
+          <div>
+            <p className="font-medium text-zinc-100 text-sm">
+              {isReady ? 'Codebase ready' : isIndexing ? 'Setting up…' : 'Codebase'}
+            </p>
+            <p className="text-xs text-zinc-500 mt-0.5">{subtitle}</p>
+          </div>
+        </div>
+
+        <button
+          onClick={onIndex}
+          disabled={isIndexing}
+          className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+            isIndexing
+              ? 'bg-zinc-800 text-zinc-500 cursor-wait'
+              : isReady
+              ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
+              : 'bg-blue-600 hover:bg-blue-500 text-white'
+          }`}
+        >
+          {isIndexing ? (
+            <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Working…</>
+          ) : isReady ? (
+            <><RefreshCw className="w-3.5 h-3.5" /> Refresh</>
+          ) : (
+            <><Brain className="w-3.5 h-3.5" /> Set up</>
+          )}
+        </button>
+      </div>
+
+      {/* Success banner */}
+      {indexJustDone && (
+        <div className="mt-4 flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-green-950/60 border border-green-800">
+          <CheckCircle2 className="w-4 h-4 text-green-400 shrink-0" />
+          <p className="text-sm text-green-300 font-medium">
+            All done! Forge now understands your codebase.
+          </p>
+        </div>
+      )}
+
+      {/* Progress bar */}
+      {isIndexing && indexProgress && !indexJustDone && (
+        <div className="mt-4">
+          <div className="h-1 rounded-full bg-zinc-800 overflow-hidden mb-3">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-500"
+              style={{
+                width:
+                  indexProgress.phase === 'tree'  ? '8%'  :
+                  indexProgress.phase === 'fetch' ? `${10 + Math.min(30, ((indexProgress.filesDone ?? 0) / Math.max(1, indexProgress.filesTotal ?? 1)) * 30)}%` :
+                  indexProgress.phase === 'chunk' ? '55%' :
+                  indexProgress.phase === 'embed' ? '75%' :
+                  indexProgress.phase === 'store' ? '92%' : '10%',
+              }}
+            />
+          </div>
+          <div className="flex justify-between">
+            {PHASE_ORDER.map((phase, i) => (
+              <span key={phase} className={`text-xs ${
+                i === currentPhaseIdx ? 'text-blue-400 font-medium' :
+                i < currentPhaseIdx   ? 'text-zinc-500' : 'text-zinc-700'
+              }`}>
+                {PHASE_LABELS[phase]}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Error */}
+      {indexProgress?.phase === 'error' && !isIndexing && (
+        <div className="mt-3 px-3 py-2.5 rounded-lg bg-red-950/50 border border-red-900">
+          <p className="text-xs text-red-400">{indexProgress.message}</p>
+        </div>
+      )}
+    </div>
   )
 }
 
-function TaskCard({
-  task,
-  expanded,
-  onToggle,
-  onCancel,
-}: {
-  task: Task
-  expanded: boolean
-  onToggle: () => void
-  onCancel: (taskId: string) => void
-}) {
+// ── Task row (sidebar) ────────────────────────────────────────────
+
+function TaskRow({ task, selected, onClick }: { task: Task; selected: boolean; onClick: () => void }) {
+  const icon = {
+    queued:  <Clock className="w-3 h-3 text-zinc-500 shrink-0" />,
+    running: <Loader2 className="w-3 h-3 text-blue-400 animate-spin shrink-0" />,
+    done:    <CheckCircle2 className="w-3 h-3 text-green-400 shrink-0" />,
+    failed:  <XCircle className="w-3 h-3 text-red-400 shrink-0" />,
+  }[task.status]
+
+  const isRunning = task.status === 'running'
+  const liveMsg = isRunning && task.resultSummary && !task.resultSummary.startsWith('[')
+    ? task.resultSummary
+    : null
+
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left px-3 py-2.5 mx-1 rounded-lg transition-colors flex items-start gap-2 group ${
+        selected ? 'bg-zinc-800' : 'hover:bg-zinc-800/60'
+      }`}
+      style={{ width: 'calc(100% - 8px)' }}
+    >
+      <span className="mt-0.5">{icon}</span>
+      <div className="min-w-0 flex-1">
+        <p className={`text-xs truncate leading-snug ${selected ? 'text-zinc-100' : 'text-zinc-400 group-hover:text-zinc-300'}`}>
+          {task.description}
+        </p>
+        {liveMsg ? (
+          <p className="text-xs text-blue-400 truncate mt-0.5 leading-snug">{liveMsg}</p>
+        ) : (
+          <p className="text-xs text-zinc-600 mt-0.5">{getTimeAgo(task.createdAt)}</p>
+        )}
+      </div>
+    </button>
+  )
+}
+
+// ── Task detail (main panel) ──────────────────────────────────────
+
+function TaskDetail({ task, onCancel }: { task: Task; onCancel: (id: string) => void }) {
   const isRunning = task.status === 'running'
   const isQueued  = task.status === 'queued'
+  const isActive  = isRunning || isQueued
+
+  const complexityMatch = task.resultSummary?.match(/^\[(SIMPLE|MEDIUM|COMPLEX) · ([^\]]+)\]/)
+  const complexityLabel = complexityMatch?.[1]
+  const modelLabel = complexityMatch?.[2]
+  const summaryText = task.resultSummary?.replace(/^\[.*?\]\s*/, '')
+
+  const liveProgress = isRunning && task.resultSummary && !complexityMatch
+    ? task.resultSummary : null
+
+  const complexityColor: Record<string, string> = {
+    SIMPLE:  'bg-green-950 text-green-400 border-green-800',
+    MEDIUM:  'bg-blue-950 text-blue-400 border-blue-800',
+    COMPLEX: 'bg-purple-950 text-purple-400 border-purple-800',
+  }
 
   const statusIcon = {
     queued:  <Clock className="w-4 h-4 text-zinc-500" />,
@@ -414,133 +481,89 @@ function TaskCard({
     failed:  <XCircle className="w-4 h-4 text-red-400" />,
   }[task.status]
 
-  const timeAgo = getTimeAgo(task.createdAt)
-
-  // While running, resultSummary holds the live progress message
-  // When done, it holds "[COMPLEX · model] summary text"
-  const complexityMatch = task.resultSummary?.match(/^\[(SIMPLE|MEDIUM|COMPLEX) · ([^\]]+)\]/)
-  const complexityLabel = complexityMatch?.[1]
-  const modelLabel = complexityMatch?.[2]
-  const complexityColor: Record<string, string> = {
-    SIMPLE:  'bg-green-950 text-green-400 border-green-800',
-    MEDIUM:  'bg-blue-950 text-blue-400 border-blue-800',
-    COMPLEX: 'bg-purple-950 text-purple-400 border-purple-800',
-  }
-
-  // Live progress message shown while running
-  const liveProgress = isRunning && task.resultSummary && !complexityMatch
-    ? task.resultSummary
-    : null
-
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
-      <button
-        onClick={onToggle}
-        className="w-full flex items-center gap-4 p-4 text-left hover:bg-zinc-800/50 transition-colors"
-      >
-        <div className="shrink-0">{statusIcon}</div>
+      {/* Header */}
+      <div className="px-5 py-4 border-b border-zinc-800 flex items-start gap-3">
+        <span className="mt-0.5 shrink-0">{statusIcon}</span>
         <div className="flex-1 min-w-0">
-          <p className="text-sm text-zinc-200 truncate">{task.description}</p>
-
-          {/* Live progress line — only while running */}
-          {liveProgress && (
-            <p className="text-xs text-blue-400 mt-1 truncate">{liveProgress}</p>
-          )}
-
-          {/* Queued state */}
-          {isQueued && (
-            <p className="text-xs text-zinc-500 mt-1">Queued — starting soon…</p>
-          )}
-
-          {/* Done / failed meta row */}
-          {!isRunning && !isQueued && (
-            <div className="flex items-center gap-2 mt-1 flex-wrap">
-              <span className="text-xs text-zinc-600">
-                {task.status === 'done' ? 'Done' : 'Failed'} · {timeAgo}
+          <p className="text-sm font-medium text-zinc-100 leading-snug">{task.description}</p>
+          <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+            <span className="text-xs text-zinc-500">{getTimeAgo(task.createdAt)}</span>
+            {complexityLabel && (
+              <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${complexityColor[complexityLabel]}`}>
+                {complexityLabel}
               </span>
-              {complexityLabel && (
-                <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${complexityColor[complexityLabel]}`}>
-                  {complexityLabel}
-                </span>
-              )}
-              {modelLabel && (
-                <span className="text-xs text-zinc-600 font-mono">{modelLabel}</span>
-              )}
-            </div>
-          )}
-
-          {/* Running meta row — time only, no model (not known yet) */}
-          {isRunning && !liveProgress && (
-            <p className="text-xs text-zinc-500 mt-1">Running · {timeAgo}</p>
-          )}
+            )}
+            {modelLabel && (
+              <span className="text-xs text-zinc-600 font-mono">{modelLabel}</span>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {(isRunning || isQueued) && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onCancel(task.id) }}
-              className="px-2 py-1 rounded-md text-xs text-zinc-500 hover:text-red-400 hover:bg-red-950/40 transition-colors border border-transparent hover:border-red-900"
-              title="Cancel task"
-            >
-              Cancel
-            </button>
-          )}
-          {expanded ? (
-            <ChevronUp className="w-4 h-4 text-zinc-600" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-zinc-600" />
-          )}
-        </div>
-      </button>
+        {isActive && (
+          <button
+            onClick={() => onCancel(task.id)}
+            className="shrink-0 px-2.5 py-1 rounded-md text-xs text-zinc-500 hover:text-red-400 hover:bg-red-950/40 border border-transparent hover:border-red-900 transition-colors"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
 
-      {expanded && (
-        <div className="border-t border-zinc-800 p-4 space-y-4">
-          {/* Summary */}
-          {task.resultSummary && (
-            <div>
-              <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1.5">Summary</p>
-              <p className="text-sm text-zinc-300">
-                {task.resultSummary.replace(/^\[.*?\]\s*/, '')}
-              </p>
+      <div className="p-5 space-y-4">
+        {/* Live progress */}
+        {liveProgress && (
+          <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-blue-950/40 border border-blue-900/50">
+            <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />
+            <p className="text-sm text-blue-300">{liveProgress}</p>
+          </div>
+        )}
+
+        {isQueued && (
+          <p className="text-sm text-zinc-500">Queued — will start shortly…</p>
+        )}
+
+        {/* Summary */}
+        {summaryText && !isActive && (
+          <div>
+            <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">What was done</p>
+            <p className="text-sm text-zinc-300 leading-relaxed">{summaryText}</p>
+          </div>
+        )}
+
+        {/* Error */}
+        {task.error && (
+          <div className="px-3 py-2.5 rounded-lg bg-red-950/50 border border-red-900">
+            <p className="text-xs text-red-400 font-medium mb-0.5">Error</p>
+            <p className="text-xs text-red-500">{task.error}</p>
+          </div>
+        )}
+
+        {/* Files changed */}
+        {task.filesChanged && task.filesChanged.length > 0 && (
+          <div>
+            <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">Files changed</p>
+            <div className="space-y-1">
+              {task.filesChanged.map((f) => (
+                <div key={f.path} className="flex items-center gap-2">
+                  <FileCode className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
+                  <span className="text-xs text-zinc-400 font-mono truncate flex-1">{f.path}</span>
+                  <span className={`text-xs px-1.5 py-0.5 rounded shrink-0 ${
+                    f.action === 'create' ? 'bg-green-950 text-green-400' :
+                    f.action === 'delete' ? 'bg-red-950 text-red-400' :
+                    'bg-blue-950 text-blue-400'
+                  }`}>
+                    {f.action}
+                  </span>
+                </div>
+              ))}
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Error */}
-          {task.error && (
-            <div className="p-3 rounded-lg bg-red-950/50 border border-red-900">
-              <p className="text-xs text-red-400">{task.error}</p>
-            </div>
-          )}
-
-          {/* Files changed */}
-          {task.filesChanged && task.filesChanged.length > 0 && (
-            <div>
-              <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1.5">
-                Files Changed
-              </p>
-              <div className="space-y-1">
-                {task.filesChanged.map((f) => (
-                  <div key={f.path} className="flex items-center gap-2">
-                    <FileCode className="w-3.5 h-3.5 text-zinc-600 shrink-0" />
-                    <span className="text-xs text-zinc-400 font-mono">{f.path}</span>
-                    <span
-                      className={`text-xs px-1.5 py-0.5 rounded ${
-                        f.action === 'create'
-                          ? 'bg-green-950 text-green-400'
-                          : f.action === 'delete'
-                          ? 'bg-red-950 text-red-400'
-                          : 'bg-blue-950 text-blue-400'
-                      }`}
-                    >
-                      {f.action}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Links */}
-          <div className="flex gap-3 flex-wrap">
+        {/* Links */}
+        {(task.prUrl || task.deployUrl) && (
+          <div className="flex gap-3 flex-wrap pt-1">
             {task.prUrl && (
               <a
                 href={task.prUrl}
@@ -549,7 +572,7 @@ function TaskCard({
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium transition-colors"
               >
                 <GitBranch className="w-3.5 h-3.5" />
-                View PR
+                View pull request
                 <ExternalLink className="w-3 h-3 text-zinc-500" />
               </a>
             )}
@@ -561,13 +584,13 @@ function TaskCard({
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-950 hover:bg-green-900 text-green-400 text-xs font-medium transition-colors border border-green-800"
               >
                 <Zap className="w-3.5 h-3.5" />
-                View Deploy
+                View deploy
                 <ExternalLink className="w-3 h-3 opacity-60" />
               </a>
             )}
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }
