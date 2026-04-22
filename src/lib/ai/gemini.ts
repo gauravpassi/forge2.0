@@ -14,8 +14,8 @@ function getGenAI(): GoogleGenerativeAI {
 // ── Models ────────────────────────────────────────────────────────
 
 export const MODELS = {
-  // Tier 1 — simple tasks, commit messages, PR bodies, embeddings
-  FLASH:   'gemini-2.0-flash',
+  // Tier 1 — simple tasks, commit messages, PR bodies, planning
+  FLASH:   'gemini-2.0-flash-lite',
   // Tier 2 — new features, moderate complexity
   FLASH_25: 'gemini-2.5-flash-preview-05-20',
   // Tier 3 — architecture, refactors, multi-file complex tasks
