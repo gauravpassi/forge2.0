@@ -1,56 +1,111 @@
 // ════════════════════════════════════════════════════════════════
 // Forge 2.0 — AI Prompts
-// Centralize all system prompts and prompt builders here.
+//
+// Structured for Claude prompt caching:
+//   SYSTEM_PROMPT       → cached (invariant)
+//   buildCachedContext  → cached per task (architecture context)
+//   buildUncachedPrompt → NOT cached (file-specific)
 // ════════════════════════════════════════════════════════════════
 
-export const SYSTEM_PROMPT = `You are Forge — an elite AI software engineer.
-You have deep knowledge of the codebase provided in the context.
-You write clean, production-ready code following the existing patterns and conventions.
-You always consider edge cases, error handling, and performance.
-You never break existing functionality.`
+export const SYSTEM_PROMPT = `You are Forge — an elite AI software engineer embedded inside a development team.
 
-// ── Task planning prompt ──────────────────────────────────────────
+Your job is to write production-ready code that slots perfectly into the existing codebase.
+
+Core principles:
+- Read the provided context carefully before writing anything
+- Mirror the exact coding style, naming conventions, and patterns you see
+- Preserve all existing functionality when modifying files
+- Add proper error handling following the codebase's patterns
+- Never add unnecessary dependencies or imports
+- Write self-documenting code; add brief comments only where the logic is non-obvious
+- Output ONLY the requested file content — no explanations, no markdown fences`
+
+// ── Planning prompt ───────────────────────────────────────────────
 
 export function buildPlanPrompt(
   taskDescription: string,
-  codebaseContext: string,
+  initialContext: string,
   repoFullName: string
 ): string {
-  return `${SYSTEM_PROMPT}
+  return `Repository: ${repoFullName}
 
-## Repository: ${repoFullName}
-
-## Relevant Codebase Context
-${codebaseContext}
+${initialContext}
 
 ## Task
 ${taskDescription}
 
-## Instructions
-Analyze the task and the codebase context carefully.
-Produce a JSON implementation plan with this exact structure:
+Produce a JSON implementation plan. Respond with ONLY this JSON object:
 
 {
-  "summary": "One-line summary of what you will do",
-  "queries": ["search query 1", "search query 2"],
+  "summary": "One-line summary of the change",
+  "queries": ["specific search query 1", "specific search query 2"],
   "files": [
     {
       "path": "src/path/to/file.ts",
       "action": "create" | "update" | "delete",
-      "reasoning": "Why this file needs to change"
+      "reasoning": "Why this specific file needs to change"
     }
   ],
   "testCommand": "npm run test (optional)"
 }
 
-IMPORTANT:
-- Use relative file paths from repo root
-- Only include files that actually need changes
-- Keep the plan minimal and focused
-- Respond with ONLY the JSON object, no markdown fences`
+Rules:
+- Use relative paths from repo root
+- Be minimal — only files that genuinely need changing
+- "queries" should be specific terms to find relevant code (function names, type names, patterns)`
 }
 
-// ── Code generation prompt ────────────────────────────────────────
+// ── Cached context block (goes into the CACHED tier) ─────────────
+// This is the architecture/type context, same for all files in a task.
+
+export function buildCachedContextBlock(
+  taskDescription: string,
+  architectureContext: string
+): string {
+  return `## Task Being Implemented
+${taskDescription}
+
+${architectureContext}`
+}
+
+// ── Uncached code generation prompt (file-specific) ───────────────
+// Changes per file — NOT cached.
+
+export function buildUncachedCodePrompt(
+  filePath: string,
+  action: 'create' | 'update',
+  fileContext: string,
+  existingContent: string | null
+): string {
+  const parts: string[] = []
+
+  if (fileContext.trim()) {
+    parts.push(fileContext)
+    parts.push('')
+  }
+
+  if (existingContent) {
+    parts.push(`## Current Content of ${filePath}`)
+    parts.push('```')
+    parts.push(existingContent)
+    parts.push('```')
+    parts.push('')
+  }
+
+  parts.push(`## Your Task`)
+  parts.push(
+    action === 'create'
+      ? `Write the complete content for the new file: ${filePath}`
+      : `Update ${filePath} to implement the task described above.`
+  )
+  parts.push('')
+  parts.push('Output ONLY the raw file content. No markdown fences. No explanation.')
+
+  return parts.join('\n')
+}
+
+// ── Legacy single-block code gen prompt (used by Gemini) ──────────
+// Gemini doesn't support prompt caching, so we send everything together.
 
 export function buildCodeGenPrompt(
   taskDescription: string,
@@ -60,40 +115,29 @@ export function buildCodeGenPrompt(
   existingContent: string | null
 ): string {
   const fileSection = existingContent
-    ? `## Existing File Content\n\`\`\`\n${existingContent}\n\`\`\``
+    ? `## Current Content of ${filePath}\n\`\`\`\n${existingContent}\n\`\`\``
     : `## File to Create\n${filePath} (does not exist yet)`
 
-  return `${SYSTEM_PROMPT}
-
-## Task
+  return `## Task
 ${taskDescription}
 
 ## File: ${filePath} (action: ${action})
 ${fileSection}
 
-## Relevant Codebase Context
 ${codebaseContext}
 
-## Instructions
 Write the complete, production-ready content for ${filePath}.
-
-Rules:
-1. Output ONLY the raw file content — no markdown fences, no explanation
-2. Preserve all existing functionality when updating
-3. Follow the exact coding style and patterns from the codebase context
-4. Add necessary imports
-5. Handle errors properly
-6. Write self-documenting code with brief comments where helpful`
+Output ONLY the raw file content — no markdown fences, no explanation.`
 }
 
-// ── PR description prompt ─────────────────────────────────────────
+// ── PR description ────────────────────────────────────────────────
 
 export function buildPRDescriptionPrompt(
   taskDescription: string,
   filesChanged: string[],
   summary: string
 ): string {
-  return `Generate a concise GitHub Pull Request description for this change.
+  return `Write a concise GitHub Pull Request description.
 
 Task: ${taskDescription}
 
@@ -104,33 +148,31 @@ Implementation summary: ${summary}
 
 Format:
 ## Summary
-<2-3 bullet points of what changed>
+<2-3 bullet points>
 
 ## Motivation
-<1-2 sentences on why this change was made>
+<1-2 sentences>
 
 ## Testing
-<How to verify the change works>
+<How to verify>
 
 ---
-*Generated by Forge 2.0 AI Engineer*`
+*Generated by Forge 2.0*`
 }
 
-// ── Commit message prompt ─────────────────────────────────────────
+// ── Commit message ────────────────────────────────────────────────
 
 export function buildCommitMessagePrompt(
   taskDescription: string,
   filesChanged: string[]
 ): string {
-  return `Write a concise git commit message for this change.
+  return `Write a git commit message.
 
 Task: ${taskDescription}
+Files: ${filesChanged.join(', ')}
 
-Files changed: ${filesChanged.join(', ')}
+Format: <type>: <description> (max 72 chars total)
+Types: feat | fix | refactor | docs | style | test | chore
 
-Rules:
-- Format: <type>: <short description> (max 72 chars)
-- Types: feat, fix, refactor, docs, style, test, chore
-- No markdown, no quotes
-- Just output the commit message line, nothing else`
+Output only the commit message line. No quotes. No explanation.`
 }

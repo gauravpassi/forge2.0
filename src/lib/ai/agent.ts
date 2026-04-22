@@ -1,7 +1,19 @@
 // ════════════════════════════════════════════════════════════════
 // Forge 2.0 — Task Agent
-// Orchestrates: RAG search → classify → plan → code gen → git → PR → deploy
-// Auto-routes to the right model based on task complexity.
+//
+// Model routing:
+//   Simple  (fix/style, 1-2 files) → Gemini 2.0 Flash
+//   Medium  (feature,   3-4 files) → Gemini 2.5 Flash
+//   Complex (refactor,  5+ files)  → Claude Sonnet 4.5 + caching
+//                                    (falls back to Gemini Thinking
+//                                     if ANTHROPIC_API_KEY not set)
+//
+// Context strategy:
+//   Planning      → Gemini Flash + broad RAG (cheap, fast)
+//   Code gen      → Split context per file:
+//                     CACHED  = system prompt + architecture chunks
+//                     UNCACHED = file-specific chunks + existing file
+//   Commit / PR   → Gemini Flash (trivial, no code needed)
 // ════════════════════════════════════════════════════════════════
 
 import {
@@ -13,9 +25,14 @@ import {
   MODELS,
   type TaskComplexity,
 } from '@/lib/ai/gemini'
+import { claudeGenerate, isClaudeAvailable, CLAUDE_MODEL } from '@/lib/ai/claude'
+import { buildSplitContext, trimExistingContent } from '@/lib/context/builder'
 import { searchCodebase, multiQuerySearch, buildContextFromResults } from '@/lib/rag/search'
 import {
+  SYSTEM_PROMPT,
   buildPlanPrompt,
+  buildCachedContextBlock,
+  buildUncachedCodePrompt,
   buildCodeGenPrompt,
   buildPRDescriptionPrompt,
   buildCommitMessagePrompt,
@@ -62,14 +79,13 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
 
   const { owner, repo } = splitRepoName(repoFullName)
 
-  // ── STEP 1: Mark running + initial RAG search ─────────────────
+  // ── STEP 1: Mark running + broad initial RAG search ───────────
   await updateTask(taskId, { status: 'running' })
 
   const initialResults = await searchCodebase(projectId, description, { matchCount: 8 })
-  const initialContext = buildContextFromResults(initialResults, 12_000)
+  const initialContext = buildContextFromResults(initialResults, 10_000)
 
-  // ── STEP 2: Planning (always use Flash — fast & cheap) ────────
-  // Planning just produces a JSON file list; doesn't need a heavy model.
+  // ── STEP 2: Plan (always Gemini Flash — fast JSON, no code) ───
   const planPrompt = buildPlanPrompt(description, initialContext, repoFullName)
   const planRaw = await generate(planPrompt, {
     model: MODELS.FLASH,
@@ -78,26 +94,31 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   })
   const plan = parseJsonResponse<AgentPlan & { queries?: string[] }>(planRaw)
 
-  // ── STEP 3: Classify complexity AFTER we know the file count ──
-  // Now we have real signal: how many files + description keywords.
+  // ── STEP 3: Classify complexity (now we know file count) ──────
   const complexity = classifyComplexity(description, plan.files.length)
-  const modelUsed = modelForComplexity(complexity)
+  const useClaudeForComplex = complexity === 'complex' && isClaudeAvailable()
+  const modelUsed = useClaudeForComplex
+    ? CLAUDE_MODEL
+    : modelForComplexity(complexity)
 
   console.log(
-    `[Forge] Task complexity: ${complexity} | Model: ${modelUsed} | Files: ${plan.files.length}`
+    `[Forge] complexity=${complexity} model=${modelUsed} ` +
+    `files=${plan.files.length} claude=${useClaudeForComplex}`
   )
 
-  // ── STEP 4: Expanded RAG search using plan's search queries ───
+  // ── STEP 4: Expanded RAG search ───────────────────────────────
   const searchQueries = [
     description,
     ...(plan.queries ?? []),
     ...plan.files.map((f) => `${f.path} ${f.reasoning}`),
-  ].slice(0, 5)
+  ].slice(0, 6)
 
-  const expandedResults = await multiQuerySearch(projectId, searchQueries, { matchCount: 10 })
-  const richContext = buildContextFromResults(expandedResults, 20_000)
+  const allResults = await multiQuerySearch(projectId, searchQueries, {
+    matchCount: 12,
+    matchThreshold: 0.4,
+  })
 
-  // ── STEP 5: Code generation (model varies by complexity) ──────
+  // ── STEP 5: Code generation ───────────────────────────────────
   const branchName = `forge/${slugify(description)}-${Date.now().toString(36)}`
   const cloneDir = await cloneRepo(accessToken, owner, repo, defaultBranch)
 
@@ -113,38 +134,88 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
       continue
     }
 
-    // Fetch current file content (if updating)
-    const existingContent =
+    // Fetch existing content
+    const rawExisting =
       fileOp.action === 'update'
         ? await getFileContent(accessToken, owner, repo, fileOp.path, defaultBranch)
         : null
 
-    // Focused RAG search for this specific file
-    const fileResults = await searchCodebase(
+    const existingContent = trimExistingContent(rawExisting, complexity)
+
+    // Focused RAG for this file
+    const fileSpecificResults = await searchCodebase(
       projectId,
       `${fileOp.path} ${fileOp.reasoning}`,
-      { matchCount: 6, matchThreshold: 0.4 }
+      { matchCount: 5, matchThreshold: 0.38 }
     )
-    const fileContext = buildContextFromResults(
-      dedup([...expandedResults, ...fileResults]).slice(0, 15),
-      18_000
-    )
+    const combinedResults = dedup([...allResults, ...fileSpecificResults])
 
-    const codePrompt = buildCodeGenPrompt(
-      description,
-      fileContext,
-      fileOp.path,
-      fileOp.action,
-      existingContent
-    )
+    let generatedContent: string
 
-    // 🔑 Use complexity-appropriate model for code generation
-    const generatedContent = await generateForComplexity(codePrompt, complexity)
+    if (useClaudeForComplex) {
+      // ── Claude path: split context + prompt caching ───────────
+      const { architectureContext, fileContext, stats } = buildSplitContext(
+        combinedResults,
+        fileOp.path,
+        complexity
+      )
 
-    generatedFiles.push({ path: fileOp.path, content: generatedContent, action: fileOp.action })
+      console.log(
+        `[Forge] ${fileOp.path} — arch=${stats.architectureChunks} chunks/${stats.architectureTokens}tok ` +
+        `file=${stats.fileChunks} chunks/${stats.fileTokens}tok`
+      )
+
+      const cachedBlock = buildCachedContextBlock(description, architectureContext)
+      const uncachedBlock = buildUncachedCodePrompt(
+        fileOp.path,
+        fileOp.action,
+        fileContext,
+        existingContent
+      )
+
+      generatedContent = await claudeGenerate(
+        SYSTEM_PROMPT,
+        cachedBlock,
+        uncachedBlock,
+        {
+          model: CLAUDE_MODEL,
+          maxTokens: 8192,
+          // Extended thinking for truly complex architecture tasks
+          thinking: plan.files.length >= 7
+            ? { budgetTokens: 5000 }
+            : undefined,
+        }
+      )
+    } else {
+      // ── Gemini path: single-block context ────────────────────
+      const { fileContext, architectureContext } = buildSplitContext(
+        combinedResults,
+        fileOp.path,
+        complexity
+      )
+      const combinedContext = [architectureContext, fileContext]
+        .filter(Boolean)
+        .join('\n\n')
+
+      const codePrompt = buildCodeGenPrompt(
+        description,
+        combinedContext,
+        fileOp.path,
+        fileOp.action,
+        existingContent
+      )
+
+      generatedContent = await generateForComplexity(codePrompt, complexity)
+    }
+
+    generatedFiles.push({
+      path: fileOp.path,
+      content: generatedContent,
+      action: fileOp.action,
+    })
   }
 
-  // ── STEP 6: Commit message (always Flash — trivial task) ──────
+  // ── STEP 6: Commit message (Gemini Flash — trivial) ───────────
   const commitMsgPrompt = buildCommitMessagePrompt(
     description,
     generatedFiles.map((f) => f.path)
@@ -157,7 +228,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     })
   ).trim()
 
-  // ── STEP 7: Apply changes, commit, push ───────────────────────
+  // ── STEP 7: Apply, commit, push ───────────────────────────────
   await applyFileChanges(cloneDir, generatedFiles)
   const pushedBranch = await commitAndPush(
     cloneDir,
@@ -168,7 +239,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     commitMessage
   )
 
-  // ── STEP 8: PR description (Flash — narrative, not code) ──────
+  // ── STEP 8: PR description (Gemini Flash) ────────────────────
   const prDescPrompt = buildPRDescriptionPrompt(
     description,
     generatedFiles.map((f) => f.path),
@@ -180,14 +251,17 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     maxOutputTokens: 1024,
   })
 
+  const modelLabel = useClaudeForComplex ? 'claude-sonnet-4-5' : modelUsed.split('/').pop()!
   const pr = await createPullRequest(accessToken, owner, repo, {
     title: `[Forge] ${plan.summary}`,
-    body: prBody + `\n\n---\n*Complexity: **${complexity}** · Model: \`${modelUsed}\`*`,
+    body:
+      prBody +
+      `\n\n---\n*Complexity: **${complexity}** · Model: \`${modelLabel}\`*`,
     head: pushedBranch,
     base: defaultBranch,
   })
 
-  // ── STEP 9: Vercel deploy (optional) ──────────────────────────
+  // ── STEP 9: Vercel deploy ─────────────────────────────────────
   let deployUrl: string | null = null
   if (vercelProject) {
     try {
@@ -197,28 +271,26 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     }
   }
 
-  // ── STEP 10: Incremental RAG re-index ────────────────────────
+  // ── STEP 10: Incremental RAG re-index (fire and forget) ───────
   const changedPaths = generatedFiles
     .filter((f) => f.action !== 'delete')
     .map((f) => f.path)
 
-  reindexChangedFiles(projectId, repoFullName, accessToken, changedPaths, defaultBranch).catch(
-    console.error
-  )
-
-  const filesChanged: FileChange[] = generatedFiles.map((f) => ({
-    path: f.path,
-    action: f.action,
-  }))
+  reindexChangedFiles(
+    projectId, repoFullName, accessToken, changedPaths, defaultBranch
+  ).catch(console.error)
 
   return {
     prUrl: pr.html_url,
     deployUrl,
-    filesChanged,
+    filesChanged: generatedFiles.map((f) => ({
+      path: f.path,
+      action: f.action,
+    })),
     summary: plan.summary,
     branchName: pushedBranch,
     complexity,
-    modelUsed,
+    modelUsed: useClaudeForComplex ? 'claude-sonnet-4-5' : modelUsed,
   }
 }
 
