@@ -79,13 +79,18 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
 
   const { owner, repo } = splitRepoName(repoFullName)
 
+  // Helper: write a live progress message visible in the UI while polling
+  const progress = (msg: string) => updateTask(taskId, { resultSummary: msg }).catch(() => {})
+
   // ── STEP 1: Mark running + broad initial RAG search ───────────
   await updateTask(taskId, { status: 'running' })
+  await progress('🔍 Searching codebase for relevant context…')
 
   const initialResults = await searchCodebase(projectId, description, { matchCount: 8 })
   const initialContext = buildContextFromResults(initialResults, 10_000)
 
   // ── STEP 2: Plan (always Gemini Flash — fast JSON, no code) ───
+  await progress('📋 Planning which files to change…')
   const planPrompt = buildPlanPrompt(description, initialContext, repoFullName)
   const planRaw = await generate(planPrompt, {
     model: MODELS.FLASH,
@@ -101,12 +106,18 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     ? CLAUDE_MODEL
     : modelForComplexity(complexity)
 
+  const modelLabel = useClaudeForComplex ? 'claude-sonnet-4-5' : modelUsed.split('/').pop()!
+  await progress(
+    `⚙️ ${complexity.toUpperCase()} task · ${plan.files.length} file${plan.files.length !== 1 ? 's' : ''} · model: ${modelLabel}`
+  )
+
   console.log(
     `[Forge] complexity=${complexity} model=${modelUsed} ` +
     `files=${plan.files.length} claude=${useClaudeForComplex}`
   )
 
   // ── STEP 4: Expanded RAG search ───────────────────────────────
+  await progress('🔍 Deep-searching for relevant patterns and types…')
   const searchQueries = [
     description,
     ...(plan.queries ?? []),
@@ -128,11 +139,17 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     action: AgentFileOp['action']
   }> = []
 
-  for (const fileOp of plan.files) {
+  for (let i = 0; i < plan.files.length; i++) {
+    const fileOp = plan.files[i]
+
     if (fileOp.action === 'delete') {
+      await progress(`🗑️ Deleting ${fileOp.path} (${i + 1}/${plan.files.length})`)
       generatedFiles.push({ path: fileOp.path, content: '', action: 'delete' })
       continue
     }
+
+    const actionVerb = fileOp.action === 'create' ? '✨ Creating' : '✏️ Updating'
+    await progress(`${actionVerb} ${fileOp.path} (${i + 1}/${plan.files.length})…`)
 
     // Fetch existing content
     const rawExisting =
@@ -216,6 +233,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   }
 
   // ── STEP 6: Commit message (Gemini Flash — trivial) ───────────
+  await progress('💬 Writing commit message…')
   const commitMsgPrompt = buildCommitMessagePrompt(
     description,
     generatedFiles.map((f) => f.path)
@@ -229,6 +247,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   ).trim()
 
   // ── STEP 7: Apply, commit, push ───────────────────────────────
+  await progress('🚀 Committing and pushing to GitHub…')
   await applyFileChanges(cloneDir, generatedFiles)
   const pushedBranch = await commitAndPush(
     cloneDir,
@@ -240,6 +259,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   )
 
   // ── STEP 8: PR description (Gemini Flash) ────────────────────
+  await progress('🔀 Opening pull request…')
   const prDescPrompt = buildPRDescriptionPrompt(
     description,
     generatedFiles.map((f) => f.path),
@@ -251,7 +271,6 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     maxOutputTokens: 1024,
   })
 
-  const modelLabel = useClaudeForComplex ? 'claude-sonnet-4-5' : modelUsed.split('/').pop()!
   const pr = await createPullRequest(accessToken, owner, repo, {
     title: `[Forge] ${plan.summary}`,
     body:
@@ -265,6 +284,7 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   let deployUrl: string | null = null
   if (vercelProject) {
     try {
+      await progress('⚡ Triggering Vercel deploy…')
       deployUrl = await triggerVercelDeploy(vercelProject, repoFullName)
     } catch {
       // Non-fatal

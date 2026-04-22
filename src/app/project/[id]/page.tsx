@@ -394,23 +394,20 @@ function TaskCard({
   expanded: boolean
   onToggle: () => void
 }) {
-  const statusIcon = {
-    queued: <Clock className="w-4 h-4 text-zinc-500" />,
-    running: <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />,
-    done: <CheckCircle2 className="w-4 h-4 text-green-400" />,
-    failed: <XCircle className="w-4 h-4 text-red-400" />,
-  }[task.status]
+  const isRunning = task.status === 'running'
+  const isQueued  = task.status === 'queued'
 
-  const statusLabel = {
-    queued: 'Queued',
-    running: 'Running…',
-    done: 'Done',
-    failed: 'Failed',
+  const statusIcon = {
+    queued:  <Clock className="w-4 h-4 text-zinc-500" />,
+    running: <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />,
+    done:    <CheckCircle2 className="w-4 h-4 text-green-400" />,
+    failed:  <XCircle className="w-4 h-4 text-red-400" />,
   }[task.status]
 
   const timeAgo = getTimeAgo(task.createdAt)
 
-  // Parse complexity badge from resultSummary prefix e.g. "[COMPLEX · gemini-2.5-flash]"
+  // While running, resultSummary holds the live progress message
+  // When done, it holds "[COMPLEX · model] summary text"
   const complexityMatch = task.resultSummary?.match(/^\[(SIMPLE|MEDIUM|COMPLEX) · ([^\]]+)\]/)
   const complexityLabel = complexityMatch?.[1]
   const modelLabel = complexityMatch?.[2]
@@ -419,6 +416,11 @@ function TaskCard({
     MEDIUM:  'bg-blue-950 text-blue-400 border-blue-800',
     COMPLEX: 'bg-purple-950 text-purple-400 border-purple-800',
   }
+
+  // Live progress message shown while running
+  const liveProgress = isRunning && task.resultSummary && !complexityMatch
+    ? task.resultSummary
+    : null
 
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
@@ -429,17 +431,38 @@ function TaskCard({
         <div className="shrink-0">{statusIcon}</div>
         <div className="flex-1 min-w-0">
           <p className="text-sm text-zinc-200 truncate">{task.description}</p>
-          <div className="flex items-center gap-2 mt-1 flex-wrap">
-            <span className="text-xs text-zinc-600">{statusLabel} · {timeAgo}</span>
-            {complexityLabel && (
-              <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${complexityColor[complexityLabel]}`}>
-                {complexityLabel}
+
+          {/* Live progress line — only while running */}
+          {liveProgress && (
+            <p className="text-xs text-blue-400 mt-1 truncate">{liveProgress}</p>
+          )}
+
+          {/* Queued state */}
+          {isQueued && (
+            <p className="text-xs text-zinc-500 mt-1">Queued — starting soon…</p>
+          )}
+
+          {/* Done / failed meta row */}
+          {!isRunning && !isQueued && (
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              <span className="text-xs text-zinc-600">
+                {task.status === 'done' ? 'Done' : 'Failed'} · {timeAgo}
               </span>
-            )}
-            {modelLabel && (
-              <span className="text-xs text-zinc-600 font-mono">{modelLabel}</span>
-            )}
-          </div>
+              {complexityLabel && (
+                <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${complexityColor[complexityLabel]}`}>
+                  {complexityLabel}
+                </span>
+              )}
+              {modelLabel && (
+                <span className="text-xs text-zinc-600 font-mono">{modelLabel}</span>
+              )}
+            </div>
+          )}
+
+          {/* Running meta row — time only, no model (not known yet) */}
+          {isRunning && !liveProgress && (
+            <p className="text-xs text-zinc-500 mt-1">Running · {timeAgo}</p>
+          )}
         </div>
         {expanded ? (
           <ChevronUp className="w-4 h-4 text-zinc-600 shrink-0" />
