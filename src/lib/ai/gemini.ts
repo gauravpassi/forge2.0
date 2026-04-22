@@ -80,7 +80,11 @@ export function modelForComplexity(complexity: TaskComplexity): string {
 /** Embed a single text string → 768-dim vector (text-embedding-004) */
 export async function embedText(text: string): Promise<number[]> {
   const genAI = getGenAI()
-  const model = genAI.getGenerativeModel({ model: 'text-embedding-004' })
+  // text-embedding-004 is only available on the v1 API (not v1beta)
+  const model = genAI.getGenerativeModel(
+    { model: 'text-embedding-004' },
+    { apiVersion: 'v1' }
+  )
   const result = await model.embedContent(text)
   return result.embedding.values
 }
