@@ -1,9 +1,18 @@
 // ════════════════════════════════════════════════════════════════
 // Forge 2.0 — Task Agent
-// Orchestrates: RAG search → planning → code gen → git → PR → deploy
+// Orchestrates: RAG search → classify → plan → code gen → git → PR → deploy
+// Auto-routes to the right model based on task complexity.
 // ════════════════════════════════════════════════════════════════
 
-import { generate, parseJsonResponse } from '@/lib/ai/gemini'
+import {
+  generate,
+  generateForComplexity,
+  classifyComplexity,
+  modelForComplexity,
+  parseJsonResponse,
+  MODELS,
+  type TaskComplexity,
+} from '@/lib/ai/gemini'
 import { searchCodebase, multiQuerySearch, buildContextFromResults } from '@/lib/rag/search'
 import {
   buildPlanPrompt,
@@ -34,6 +43,8 @@ export interface AgentRunResult {
   filesChanged: FileChange[]
   summary: string
   branchName: string
+  complexity: TaskComplexity
+  modelUsed: string
 }
 
 // ── Main agent orchestration ──────────────────────────────────────
@@ -51,18 +62,32 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
 
   const { owner, repo } = splitRepoName(repoFullName)
 
-  // ── STEP 1: Initial RAG search ────────────────────────────────
+  // ── STEP 1: Mark running + initial RAG search ─────────────────
   await updateTask(taskId, { status: 'running' })
 
   const initialResults = await searchCodebase(projectId, description, { matchCount: 8 })
   const initialContext = buildContextFromResults(initialResults, 12_000)
 
-  // ── STEP 2: Planning ──────────────────────────────────────────
+  // ── STEP 2: Planning (always use Flash — fast & cheap) ────────
+  // Planning just produces a JSON file list; doesn't need a heavy model.
   const planPrompt = buildPlanPrompt(description, initialContext, repoFullName)
-  const planRaw = await generate(planPrompt, { temperature: 0.1, maxOutputTokens: 2048 })
+  const planRaw = await generate(planPrompt, {
+    model: MODELS.FLASH,
+    temperature: 0.1,
+    maxOutputTokens: 2048,
+  })
   const plan = parseJsonResponse<AgentPlan & { queries?: string[] }>(planRaw)
 
-  // ── STEP 3: Expanded RAG search using plan's queries ──────────
+  // ── STEP 3: Classify complexity AFTER we know the file count ──
+  // Now we have real signal: how many files + description keywords.
+  const complexity = classifyComplexity(description, plan.files.length)
+  const modelUsed = modelForComplexity(complexity)
+
+  console.log(
+    `[Forge] Task complexity: ${complexity} | Model: ${modelUsed} | Files: ${plan.files.length}`
+  )
+
+  // ── STEP 4: Expanded RAG search using plan's search queries ───
   const searchQueries = [
     description,
     ...(plan.queries ?? []),
@@ -72,11 +97,15 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
   const expandedResults = await multiQuerySearch(projectId, searchQueries, { matchCount: 10 })
   const richContext = buildContextFromResults(expandedResults, 20_000)
 
-  // ── STEP 4: Code generation for each file ────────────────────
+  // ── STEP 5: Code generation (model varies by complexity) ──────
   const branchName = `forge/${slugify(description)}-${Date.now().toString(36)}`
   const cloneDir = await cloneRepo(accessToken, owner, repo, defaultBranch)
 
-  const generatedFiles: Array<{ path: string; content: string; action: AgentFileOp['action'] }> = []
+  const generatedFiles: Array<{
+    path: string
+    content: string
+    action: AgentFileOp['action']
+  }> = []
 
   for (const fileOp of plan.files) {
     if (fileOp.action === 'delete') {
@@ -90,13 +119,14 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
         ? await getFileContent(accessToken, owner, repo, fileOp.path, defaultBranch)
         : null
 
-    // Extra focused search for this specific file
-    const fileResults = await searchCodebase(projectId, `${fileOp.path} ${fileOp.reasoning}`, {
-      matchCount: 6,
-      matchThreshold: 0.4,
-    })
+    // Focused RAG search for this specific file
+    const fileResults = await searchCodebase(
+      projectId,
+      `${fileOp.path} ${fileOp.reasoning}`,
+      { matchCount: 6, matchThreshold: 0.4 }
+    )
     const fileContext = buildContextFromResults(
-      [...new Map([...expandedResults, ...fileResults].map((r) => [r.id, r])).values()].slice(0, 15),
+      dedup([...expandedResults, ...fileResults]).slice(0, 15),
       18_000
     )
 
@@ -108,22 +138,26 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
       existingContent
     )
 
-    const generatedContent = await generate(codePrompt, {
-      temperature: 0.15,
-      maxOutputTokens: 8192,
-    })
+    // 🔑 Use complexity-appropriate model for code generation
+    const generatedContent = await generateForComplexity(codePrompt, complexity)
 
     generatedFiles.push({ path: fileOp.path, content: generatedContent, action: fileOp.action })
   }
 
-  // ── STEP 5: Commit message ─────────────────────────────────────
+  // ── STEP 6: Commit message (always Flash — trivial task) ──────
   const commitMsgPrompt = buildCommitMessagePrompt(
     description,
     generatedFiles.map((f) => f.path)
   )
-  const commitMessage = (await generate(commitMsgPrompt, { temperature: 0, maxOutputTokens: 100 })).trim()
+  const commitMessage = (
+    await generate(commitMsgPrompt, {
+      model: MODELS.FLASH,
+      temperature: 0,
+      maxOutputTokens: 100,
+    })
+  ).trim()
 
-  // ── STEP 6: Apply changes, commit, push ───────────────────────
+  // ── STEP 7: Apply changes, commit, push ───────────────────────
   await applyFileChanges(cloneDir, generatedFiles)
   const pushedBranch = await commitAndPush(
     cloneDir,
@@ -134,44 +168,47 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     commitMessage
   )
 
-  // ── STEP 7: Create Pull Request ───────────────────────────────
+  // ── STEP 8: PR description (Flash — narrative, not code) ──────
   const prDescPrompt = buildPRDescriptionPrompt(
     description,
     generatedFiles.map((f) => f.path),
     plan.summary
   )
-  const prBody = await generate(prDescPrompt, { temperature: 0.2, maxOutputTokens: 1024 })
+  const prBody = await generate(prDescPrompt, {
+    model: MODELS.FLASH,
+    temperature: 0.2,
+    maxOutputTokens: 1024,
+  })
 
   const pr = await createPullRequest(accessToken, owner, repo, {
     title: `[Forge] ${plan.summary}`,
-    body: prBody,
+    body: prBody + `\n\n---\n*Complexity: **${complexity}** · Model: \`${modelUsed}\`*`,
     head: pushedBranch,
     base: defaultBranch,
   })
 
-  // ── STEP 8: Vercel deploy (optional) ──────────────────────────
+  // ── STEP 9: Vercel deploy (optional) ──────────────────────────
   let deployUrl: string | null = null
   if (vercelProject) {
     try {
       deployUrl = await triggerVercelDeploy(vercelProject, repoFullName)
     } catch {
-      // Non-fatal — PR was created successfully
+      // Non-fatal
     }
   }
 
-  // ── STEP 9: Update RAG with changed files ─────────────────────
+  // ── STEP 10: Incremental RAG re-index ────────────────────────
   const changedPaths = generatedFiles
     .filter((f) => f.action !== 'delete')
     .map((f) => f.path)
 
-  // Fire-and-forget incremental re-index
   reindexChangedFiles(projectId, repoFullName, accessToken, changedPaths, defaultBranch).catch(
     console.error
   )
 
   const filesChanged: FileChange[] = generatedFiles.map((f) => ({
     path: f.path,
-    action: f.action === 'delete' ? 'delete' : f.action,
+    action: f.action,
   }))
 
   return {
@@ -180,6 +217,8 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     filesChanged,
     summary: plan.summary,
     branchName: pushedBranch,
+    complexity,
+    modelUsed,
   }
 }
 
@@ -191,4 +230,12 @@ function slugify(text: string): string {
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
     .slice(0, 40)
+}
+
+function dedup<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Map<string, T>()
+  for (const item of items) {
+    if (!seen.has(item.id)) seen.set(item.id, item)
+  }
+  return Array.from(seen.values())
 }

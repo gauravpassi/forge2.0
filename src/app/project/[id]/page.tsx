@@ -363,6 +363,16 @@ function TaskCard({
 
   const timeAgo = getTimeAgo(task.createdAt)
 
+  // Parse complexity badge from resultSummary prefix e.g. "[COMPLEX · gemini-2.5-flash]"
+  const complexityMatch = task.resultSummary?.match(/^\[(SIMPLE|MEDIUM|COMPLEX) · ([^\]]+)\]/)
+  const complexityLabel = complexityMatch?.[1]
+  const modelLabel = complexityMatch?.[2]
+  const complexityColor: Record<string, string> = {
+    SIMPLE:  'bg-green-950 text-green-400 border-green-800',
+    MEDIUM:  'bg-blue-950 text-blue-400 border-blue-800',
+    COMPLEX: 'bg-purple-950 text-purple-400 border-purple-800',
+  }
+
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
       <button
@@ -372,9 +382,17 @@ function TaskCard({
         <div className="shrink-0">{statusIcon}</div>
         <div className="flex-1 min-w-0">
           <p className="text-sm text-zinc-200 truncate">{task.description}</p>
-          <p className="text-xs text-zinc-600 mt-0.5">
-            {statusLabel} · {timeAgo}
-          </p>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <span className="text-xs text-zinc-600">{statusLabel} · {timeAgo}</span>
+            {complexityLabel && (
+              <span className={`text-xs px-1.5 py-0.5 rounded border font-medium ${complexityColor[complexityLabel]}`}>
+                {complexityLabel}
+              </span>
+            )}
+            {modelLabel && (
+              <span className="text-xs text-zinc-600 font-mono">{modelLabel}</span>
+            )}
+          </div>
         </div>
         {expanded ? (
           <ChevronUp className="w-4 h-4 text-zinc-600 shrink-0" />
@@ -389,7 +407,9 @@ function TaskCard({
           {task.resultSummary && (
             <div>
               <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1.5">Summary</p>
-              <p className="text-sm text-zinc-300">{task.resultSummary}</p>
+              <p className="text-sm text-zinc-300">
+                {task.resultSummary.replace(/^\[.*?\]\s*/, '')}
+              </p>
             </div>
           )}
 

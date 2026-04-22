@@ -11,6 +11,70 @@ function getGenAI(): GoogleGenerativeAI {
   return _genAI
 }
 
+// ── Models ────────────────────────────────────────────────────────
+
+export const MODELS = {
+  // Tier 1 — simple tasks, commit messages, PR bodies, embeddings
+  FLASH:   'gemini-2.0-flash',
+  // Tier 2 — new features, moderate complexity
+  FLASH_25: 'gemini-2.5-flash-preview-05-20',
+  // Tier 3 — architecture, refactors, multi-file complex tasks
+  THINKING: 'gemini-2.5-flash-preview-05-20', // thinking mode via thinkingConfig
+} as const
+
+export type TaskComplexity = 'simple' | 'medium' | 'complex'
+
+// ── Complexity classifier ─────────────────────────────────────────
+
+const COMPLEX_KEYWORDS = [
+  'refactor', 'migrate', 'migration', 'redesign', 'architecture',
+  'integrate', 'integration', 'overhaul', 'restructure', 'rewrite',
+  'implement', 'build', 'create', 'module', 'system', 'framework',
+  'authentication', 'authorization', 'database', 'schema', 'api',
+  'pipeline', 'workflow', 'service', 'provider', 'middleware',
+]
+
+const SIMPLE_KEYWORDS = [
+  'fix', 'bug', 'typo', 'rename', 'color', 'style', 'css',
+  'text', 'label', 'copy', 'wording', 'margin', 'padding',
+  'remove', 'delete', 'update', 'change', 'adjust', 'tweak',
+  'add prop', 'add field', 'add class', 'add attribute',
+  'button', 'icon', 'tooltip', 'placeholder', 'import',
+]
+
+/**
+ * Classify a task's complexity based on its description and
+ * the number of files the agent plans to touch.
+ */
+export function classifyComplexity(
+  description: string,
+  plannedFileCount: number
+): TaskComplexity {
+  const lower = description.toLowerCase()
+
+  const isComplex =
+    plannedFileCount >= 5 ||
+    COMPLEX_KEYWORDS.some((k) => lower.includes(k))
+
+  const isSimple =
+    plannedFileCount <= 2 &&
+    SIMPLE_KEYWORDS.some((k) => lower.includes(k)) &&
+    !isComplex
+
+  if (isComplex) return 'complex'
+  if (isSimple) return 'simple'
+  return 'medium'
+}
+
+/** Pick the right model for a given complexity tier */
+export function modelForComplexity(complexity: TaskComplexity): string {
+  switch (complexity) {
+    case 'simple':  return MODELS.FLASH
+    case 'medium':  return MODELS.FLASH_25
+    case 'complex': return MODELS.THINKING
+  }
+}
+
 // ── Embedding ─────────────────────────────────────────────────────
 
 /** Embed a single text string → 768-dim vector (text-embedding-004) */
@@ -35,24 +99,27 @@ export async function embedBatch(texts: string[]): Promise<number[][]> {
 
 // ── Generation ────────────────────────────────────────────────────
 
-const FLASH = 'gemini-2.0-flash'
-const FLASH_THINKING = 'gemini-2.5-flash-preview-04-17'
-
 export interface GenerateOptions {
   model?: string
   temperature?: number
   maxOutputTokens?: number
   systemInstruction?: string
+  /** Enable extended thinking (only effective on 2.5 Flash Thinking) */
+  thinking?: boolean
 }
 
-/** Single-turn text generation with Gemini Flash */
+/** Single-turn text generation */
 export async function generate(
   prompt: string,
   options: GenerateOptions = {}
 ): Promise<string> {
   const genAI = getGenAI()
+
+  const modelName = options.model ?? MODELS.FLASH
+  const useThinking = options.thinking && modelName === MODELS.THINKING
+
   const model = genAI.getGenerativeModel({
-    model: options.model ?? FLASH,
+    model: modelName,
     ...(options.systemInstruction
       ? { systemInstruction: options.systemInstruction }
       : {}),
@@ -60,22 +127,52 @@ export async function generate(
       temperature: options.temperature ?? 0.2,
       maxOutputTokens: options.maxOutputTokens ?? 8192,
     },
+    // Enable thinking budget for complex tasks
+    ...(useThinking
+      ? {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          thinkingConfig: { thinkingBudget: 8192 } as any,
+        }
+      : {}),
   })
+
   const result = await model.generateContent(prompt)
   return result.response.text()
 }
 
-/** Generate with complex reasoning (Gemini 2.5 Flash Thinking) */
-export async function generateWithThinking(
+/**
+ * Generate code/text using the appropriate model for the task's complexity.
+ * This is the main entry point used by the agent for all generation calls.
+ */
+export async function generateForComplexity(
   prompt: string,
-  options: GenerateOptions = {}
+  complexity: TaskComplexity,
+  options: Omit<GenerateOptions, 'model'> = {}
 ): Promise<string> {
-  return generate(prompt, { ...options, model: FLASH_THINKING })
+  const model = modelForComplexity(complexity)
+  const useThinking = complexity === 'complex'
+
+  return generate(prompt, {
+    ...options,
+    model,
+    thinking: useThinking,
+    // Complex tasks get more output tokens
+    maxOutputTokens: options.maxOutputTokens ?? (
+      complexity === 'complex' ? 16384 :
+      complexity === 'medium'  ? 10240 :
+                                  6144
+    ),
+    // Lower temperature for complex tasks (more deterministic)
+    temperature: options.temperature ?? (
+      complexity === 'complex' ? 0.1 :
+      complexity === 'medium'  ? 0.15 :
+                                  0.2
+    ),
+  })
 }
 
 /** Parse JSON from Gemini response (strips markdown fences) */
 export function parseJsonResponse<T>(text: string): T {
-  // Strip markdown code fences if present
   const cleaned = text
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/```\s*$/, '')
@@ -83,4 +180,10 @@ export function parseJsonResponse<T>(text: string): T {
   return JSON.parse(cleaned) as T
 }
 
-export { FLASH, FLASH_THINKING }
+/** Estimate cost for a task (approximate, in USD) */
+export function estimateCost(complexity: TaskComplexity, fileCount: number): string {
+  const base = complexity === 'simple' ? 0.003 : complexity === 'medium' ? 0.010 : 0.025
+  const perFile = complexity === 'simple' ? 0.001 : complexity === 'medium' ? 0.003 : 0.006
+  const total = base + fileCount * perFile
+  return `~$${total.toFixed(3)}`
+}

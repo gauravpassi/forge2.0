@@ -87,7 +87,8 @@ export async function POST(
           branchName: result.branchName,
           prUrl: result.prUrl,
           deployUrl: result.deployUrl ?? undefined,
-          resultSummary: result.summary,
+          // Include complexity + model in summary so UI can display it
+          resultSummary: `[${result.complexity.toUpperCase()} · ${result.modelUsed.split('/').pop()}] ${result.summary}`,
           filesChanged: result.filesChanged,
           completedAt: new Date().toISOString(),
         })
