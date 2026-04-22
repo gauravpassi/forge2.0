@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/auth'
-import { getProject, createTask, updateTask, getProjectTasks } from '@/lib/supabase'
+import { getProject, createTask, updateTask, getProjectTasks, getTaskById } from '@/lib/supabase'
 import { runTaskAgent } from '@/lib/ai/agent'
 
 export const runtime = 'nodejs'
@@ -106,5 +106,43 @@ export async function POST(
   } catch (err) {
     console.error('Failed to submit task:', err)
     return NextResponse.json({ error: 'Failed to submit task' }, { status: 500 })
+  }
+}
+
+// PATCH /api/projects/[id]/tasks — cancel a running/queued task
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const session = await auth()
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const { id: projectId } = await params
+
+  try {
+    const body = await req.json()
+    const { taskId } = body as { taskId: string }
+    if (!taskId) return NextResponse.json({ error: 'taskId required' }, { status: 400 })
+
+    const task = await getTaskById(taskId)
+    if (task.projectId !== projectId || task.userId !== session.user.id) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+    if (task.status !== 'running' && task.status !== 'queued') {
+      return NextResponse.json({ error: 'Task is not cancellable' }, { status: 422 })
+    }
+
+    await updateTask(taskId, {
+      status: 'failed',
+      error: 'Cancelled by user',
+      completedAt: new Date().toISOString(),
+    })
+
+    return NextResponse.json({ data: { cancelled: true } })
+  } catch (err) {
+    console.error('Failed to cancel task:', err)
+    return NextResponse.json({ error: 'Failed to cancel task' }, { status: 500 })
   }
 }

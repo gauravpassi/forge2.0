@@ -243,6 +243,16 @@ export async function updateTask(
   if (error) throw error
 }
 
+export async function getTaskById(taskId: string) {
+  const { data, error } = await getSupabaseAdmin()
+    .from('tasks')
+    .select('*')
+    .eq('id', taskId)
+    .single()
+  if (error) throw error
+  return mapTask(data)
+}
+
 export async function getProjectTasks(projectId: string) {
   const { data, error } = await getSupabaseAdmin()
     .from('tasks')

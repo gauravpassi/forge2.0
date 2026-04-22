@@ -358,6 +358,14 @@ export default function ProjectPage() {
                   task={task}
                   expanded={expandedTask === task.id}
                   onToggle={() => setExpandedTask(expandedTask === task.id ? null : task.id)}
+                  onCancel={async (taskId) => {
+                    await fetch(`/api/projects/${projectId}/tasks`, {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ taskId }),
+                    })
+                    await loadProject()
+                  }}
                 />
               ))}
             </div>
@@ -389,10 +397,12 @@ function TaskCard({
   task,
   expanded,
   onToggle,
+  onCancel,
 }: {
   task: Task
   expanded: boolean
   onToggle: () => void
+  onCancel: (taskId: string) => void
 }) {
   const isRunning = task.status === 'running'
   const isQueued  = task.status === 'queued'
@@ -464,11 +474,22 @@ function TaskCard({
             <p className="text-xs text-zinc-500 mt-1">Running · {timeAgo}</p>
           )}
         </div>
-        {expanded ? (
-          <ChevronUp className="w-4 h-4 text-zinc-600 shrink-0" />
-        ) : (
-          <ChevronDown className="w-4 h-4 text-zinc-600 shrink-0" />
-        )}
+        <div className="flex items-center gap-2 shrink-0">
+          {(isRunning || isQueued) && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onCancel(task.id) }}
+              className="px-2 py-1 rounded-md text-xs text-zinc-500 hover:text-red-400 hover:bg-red-950/40 transition-colors border border-transparent hover:border-red-900"
+              title="Cancel task"
+            >
+              Cancel
+            </button>
+          )}
+          {expanded ? (
+            <ChevronUp className="w-4 h-4 text-zinc-600" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-zinc-600" />
+          )}
+        </div>
       </button>
 
       {expanded && (
