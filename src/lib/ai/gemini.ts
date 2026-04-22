@@ -77,29 +77,69 @@ export function modelForComplexity(complexity: TaskComplexity): string {
 
 // ── Embedding ─────────────────────────────────────────────────────
 
-/** Embed a single text string → 768-dim vector */
+const EMBED_MODEL = 'gemini-embedding-001'
+// Free tier: 15 RPM. batchEmbedContents = 1 call per N texts.
+// Max 100 texts per batch call (Google limit).
+const EMBED_BATCH_SIZE = 100
+// Delay between batch calls to stay safely under 15 RPM
+const EMBED_BATCH_DELAY_MS = 4_500   // ~13 RPM — safe margin
+
+/** Embed a single text → 768-dim vector (with retry) */
 export async function embedText(text: string): Promise<number[]> {
-  const genAI = getGenAI()
-  // gemini-embedding-001 natively outputs 3072 dims; truncate to 768
-  // via outputDimensionality to match our pgvector(768) schema.
-  const model = genAI.getGenerativeModel({ model: 'gemini-embedding-001' })
-  const result = await model.embedContent({
-    content: { parts: [{ text }], role: 'user' },
-    outputDimensionality: 768,
-  } as Parameters<typeof model.embedContent>[0])
-  return result.embedding.values
+  const results = await embedBatch([text])
+  return results[0]
 }
 
-/** Embed multiple texts in batches of 20 (API limit) */
+/**
+ * Embed multiple texts efficiently using batchEmbedContents.
+ * One API call per 100 texts instead of one call per text.
+ * Retries on 429 with exponential backoff.
+ */
 export async function embedBatch(texts: string[]): Promise<number[][]> {
-  const BATCH_SIZE = 20
-  const results: number[][] = []
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE)
-    const embeddings = await Promise.all(batch.map(embedText))
-    results.push(...embeddings)
+  const genAI = getGenAI()
+  const model = genAI.getGenerativeModel({ model: EMBED_MODEL })
+  const allEmbeddings: number[][] = []
+
+  for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
+    const slice = texts.slice(i, i + EMBED_BATCH_SIZE)
+
+    // Retry loop with exponential backoff for 429s
+    let delay = 5_000
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const result = await model.batchEmbedContents({
+          requests: slice.map((text) => ({
+            content: { parts: [{ text }], role: 'user' },
+            outputDimensionality: 768,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any)),
+        })
+        allEmbeddings.push(...result.embeddings.map((e) => e.values))
+        break
+      } catch (err: unknown) {
+        const msg = String(err)
+        const is429 = msg.includes('429') || msg.includes('Too Many Requests') || msg.includes('quota')
+        if (is429 && attempt < 4) {
+          console.log(`[Embed] 429 rate limit — waiting ${delay / 1000}s before retry ${attempt + 1}/4`)
+          await sleep(delay)
+          delay *= 2   // exponential backoff: 5s → 10s → 20s → 40s
+        } else {
+          throw err
+        }
+      }
+    }
+
+    // Polite delay between batch calls to stay under 15 RPM
+    if (i + EMBED_BATCH_SIZE < texts.length) {
+      await sleep(EMBED_BATCH_DELAY_MS)
+    }
   }
-  return results
+
+  return allEmbeddings
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // ── Generation ────────────────────────────────────────────────────
