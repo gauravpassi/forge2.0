@@ -1,125 +1,150 @@
 // ════════════════════════════════════════════════════════════════
-// Forge 2.0 — Git Operations
-// Clone → branch → apply changes → commit → push
-// Uses simple-git + temp directories
+// Forge 2.0 — Git Operations (GitHub REST API)
+//
+// Uses GitHub's Git Data API instead of the git binary.
+// Works in Vercel serverless (no git binary needed).
+//
+// Flow:
+//   1. Get base branch commit SHA
+//   2. Create blobs for each changed file
+//   3. Create a new tree (inheriting from base tree)
+//   4. Create a commit pointing to the new tree
+//   5. Create a new branch ref pointing to that commit
 // ════════════════════════════════════════════════════════════════
 
-import simpleGit, { SimpleGit } from 'simple-git'
-import { mkdtemp, writeFile, mkdir, unlink } from 'fs/promises'
-import { join, dirname } from 'path'
-import { tmpdir } from 'os'
-
-// ── Clone ─────────────────────────────────────────────────────────
-
-/**
- * Clone a repo to a temp directory and return the path.
- * Uses the GitHub token for auth via HTTPS.
- */
-export async function cloneRepo(
-  accessToken: string,
-  owner: string,
-  repo: string,
-  branch: string
-): Promise<string> {
-  const cloneDir = await mkdtemp(join(tmpdir(), `forge-${owner}-${repo}-`))
-  const remoteUrl = `https://x-access-token:${accessToken}@github.com/${owner}/${repo}.git`
-
-  const git = simpleGit()
-  await git.clone(remoteUrl, cloneDir, ['--branch', branch, '--depth', '1'])
-
-  // Configure git identity for commits
-  const localGit = simpleGit(cloneDir)
-  await localGit.addConfig('user.name', 'Forge AI')
-  await localGit.addConfig('user.email', 'forge-ai@forge2.dev')
-
-  return cloneDir
-}
-
-// ── Apply file changes ────────────────────────────────────────────
+import { getOctokit } from '@/lib/github'
 
 export interface FileChange {
-  path: string           // relative to repo root
-  content: string        // full file content (empty = delete)
+  path: string
+  content: string        // full file content (empty string for deletes)
   action: 'create' | 'update' | 'delete'
 }
 
-export async function applyFileChanges(
-  cloneDir: string,
-  changes: FileChange[]
-): Promise<void> {
-  for (const change of changes) {
-    const absolutePath = join(cloneDir, change.path)
+// ── No-op stubs (kept so agent.ts import surface doesn't change) ──
 
-    if (change.action === 'delete') {
-      try {
-        await unlink(absolutePath)
-      } catch {
-        // File might not exist — ignore
-      }
-      continue
-    }
-
-    // Ensure parent directories exist
-    await mkdir(dirname(absolutePath), { recursive: true })
-    await writeFile(absolutePath, change.content, 'utf-8')
-  }
+/** No-op: we no longer clone to disk. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export async function cloneRepo(
+  _accessToken: string,
+  _owner: string,
+  _repo: string,
+  _branch: string
+): Promise<string> {
+  return 'noop' // cloneDir is unused in the new flow
 }
 
-// ── Commit & push ─────────────────────────────────────────────────
+/** No-op: file changes are applied directly via API in commitAndPush. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export async function applyFileChanges(
+  _cloneDir: string,
+  _changes: FileChange[]
+): Promise<void> {
+  // Changes are now carried through agent.ts and applied in commitAndPush
+}
+
+// ── Core: create branch + commit via GitHub API ───────────────────
 
 /**
- * Create a new branch, stage all changes, commit, and push.
- * Returns the branch name actually pushed.
+ * Create a new branch and commit all file changes via the GitHub Git Data API.
+ * No git binary required — pure REST calls.
  */
 export async function commitAndPush(
-  cloneDir: string,
+  _cloneDir: string,           // ignored — kept for API compatibility
   accessToken: string,
   owner: string,
   repo: string,
   branchName: string,
-  commitMessage: string
+  commitMessage: string,
+  changes?: FileChange[]        // passed from agent.ts
 ): Promise<string> {
-  const git: SimpleGit = simpleGit(cloneDir)
-
-  // Create and checkout new branch
-  await git.checkoutLocalBranch(branchName)
-
-  // Stage all changes
-  await git.add('.')
-
-  // Check if there's anything to commit
-  const status = await git.status()
-  if (status.files.length === 0) {
-    throw new Error('No changes to commit')
+  if (!changes || changes.length === 0) {
+    throw new Error('No file changes provided')
   }
 
-  // Commit
-  await git.commit(commitMessage)
+  const octokit = getOctokit(accessToken)
 
-  // Set remote with auth token embedded
-  const remoteUrl = `https://x-access-token:${accessToken}@github.com/${owner}/${repo}.git`
-  await git.remote(['set-url', 'origin', remoteUrl])
+  // 1. Find the default branch's latest commit SHA
+  const { data: repoData } = await octokit.repos.get({ owner, repo })
+  const defaultBranch = repoData.default_branch
 
-  // Push new branch
-  await git.push('origin', branchName, ['--set-upstream'])
+  const { data: refData } = await octokit.git.getRef({
+    owner,
+    repo,
+    ref: `heads/${defaultBranch}`,
+  })
+  const baseSha = refData.object.sha
+
+  // 2. Get the base commit to find its tree SHA
+  const { data: baseCommit } = await octokit.git.getCommit({
+    owner,
+    repo,
+    commit_sha: baseSha,
+  })
+  const baseTreeSha = baseCommit.tree.sha
+
+  // 3. Build tree items — create blobs for creates/updates, null sha for deletes
+  type TreeItem = {
+    path: string
+    mode: '100644'
+    type: 'blob'
+    sha?: string | null
+    content?: string
+  }
+
+  const treeItems: TreeItem[] = []
+
+  for (const change of changes) {
+    if (change.action === 'delete') {
+      treeItems.push({
+        path: change.path,
+        mode: '100644',
+        type: 'blob',
+        sha: null,   // null = delete this path
+      })
+    } else {
+      // Use inline content — GitHub creates the blob automatically
+      treeItems.push({
+        path: change.path,
+        mode: '100644',
+        type: 'blob',
+        content: change.content,
+      })
+    }
+  }
+
+  // 4. Create a new tree inheriting from base
+  const { data: newTree } = await octokit.git.createTree({
+    owner,
+    repo,
+    base_tree: baseTreeSha,
+    tree: treeItems,
+  })
+
+  // 5. Create the commit
+  const { data: newCommit } = await octokit.git.createCommit({
+    owner,
+    repo,
+    message: commitMessage,
+    tree: newTree.sha,
+    parents: [baseSha],
+    author: {
+      name: 'Forge AI',
+      email: 'forge-ai@forge2.dev',
+      date: new Date().toISOString(),
+    },
+  })
+
+  // 6. Create the new branch ref pointing to the commit
+  await octokit.git.createRef({
+    owner,
+    repo,
+    ref: `refs/heads/${branchName}`,
+    sha: newCommit.sha,
+  })
 
   return branchName
 }
 
-// ── Get diff (for debugging / PR body) ───────────────────────────
-
-export async function getDiff(cloneDir: string): Promise<string> {
-  const git: SimpleGit = simpleGit(cloneDir)
-  return git.diff(['HEAD'])
-}
-
-// ── Cleanup ───────────────────────────────────────────────────────
-
-export async function cleanupClone(cloneDir: string): Promise<void> {
-  const { rm } = await import('fs/promises')
-  try {
-    await rm(cloneDir, { recursive: true, force: true })
-  } catch {
-    // Non-fatal
-  }
-}
+/** No-op cleanup — nothing to clean up without local clone */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export async function cleanupClone(_cloneDir: string): Promise<void> {}

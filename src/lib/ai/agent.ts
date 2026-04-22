@@ -246,16 +246,17 @@ export async function runTaskAgent(input: AgentRunInput): Promise<AgentRunResult
     })
   ).trim()
 
-  // ── STEP 7: Apply, commit, push ───────────────────────────────
+  // ── STEP 7: Commit & push via GitHub API (no git binary needed) ──
   await progress('🚀 Committing and pushing to GitHub…')
-  await applyFileChanges(cloneDir, generatedFiles)
+  await applyFileChanges(cloneDir, generatedFiles)  // no-op in API mode
   const pushedBranch = await commitAndPush(
     cloneDir,
     accessToken,
     owner,
     repo,
     branchName,
-    commitMessage
+    commitMessage,
+    generatedFiles  // pass changes directly to the API layer
   )
 
   // ── STEP 8: PR description (Gemini Flash) ────────────────────
